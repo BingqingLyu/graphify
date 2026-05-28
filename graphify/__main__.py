@@ -4802,7 +4802,7 @@ def main() -> None:
                 _db_path = str(graphify_out / "graph.db")
                 _is_inc = Path(_db_path).exists()
                 _db, _conn = _init_db(_db_path)
-                _ensure_schema(_conn)
+                _ensure_schema(_conn, create_tables=not _is_inc)
                 _ingest(_conn, merged, incremental=_is_inc,
                         prune_sources=deleted_files or None, root=target)
                 _close_db(_db, _conn)
@@ -4898,7 +4898,7 @@ def main() -> None:
             _db_path = str(graphify_out / "graph.db")
             _is_inc = Path(_db_path).exists()
             _db, _conn = _init_db(_db_path)
-            _ensure_schema(_conn)
+            _ensure_schema(_conn, create_tables=not _is_inc)
             _ingest(_conn, merged, incremental=_is_inc,
                     prune_sources=deleted_files or None, root=target)
             _ingest_comm(_conn, communities)
