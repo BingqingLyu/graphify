@@ -3,6 +3,9 @@
 Backend calls are mocked - no network. Covers the happy path, partial replies,
 malformed replies, and the no-backend fallback.
 """
+import json
+import sys
+
 import networkx as nx
 import pytest
 
@@ -38,6 +41,83 @@ def test_label_communities_happy_path(monkeypatch):
     assert "place_order" in captured["prompt"]
     assert "StripeClient" in captured["prompt"]
     assert captured["backend"] == "gemini"
+
+
+def test_label_communities_passes_model_override(monkeypatch):
+    G, communities = _graph()
+    captured = {}
+
+    def fake_call(prompt, *, backend, max_tokens=200, model=None):
+        captured["backend"] = backend
+        captured["model"] = model
+        return '{"0": "Order Management", "1": "Payment Flow"}'
+
+    monkeypatch.setattr("graphify.llm._call_llm", fake_call)
+    labels = label_communities(
+        G,
+        communities,
+        backend="gemini",
+        model="gemini-3.1-flash-lite",
+    )
+
+    assert labels == {0: "Order Management", 1: "Payment Flow"}
+    assert captured == {"backend": "gemini", "model": "gemini-3.1-flash-lite"}
+
+
+def test_label_cli_passes_model_override(tmp_path, monkeypatch):
+    import graphify.__main__ as cli
+
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    graph = {
+        "directed": False,
+        "multigraph": False,
+        "nodes": [
+            {"id": "n1", "label": "OrderService", "community": 0},
+        ],
+        "links": [],
+    }
+    (out / "graph.json").write_text(json.dumps(graph), encoding="utf-8")
+
+    captured = {}
+
+    def fake_generate(G, communities, *, backend=None, model=None, gods=None,
+                      quiet=False, max_concurrency=4, batch_size=100):
+        captured["backend"] = backend
+        captured["model"] = model
+        captured["max_concurrency"] = max_concurrency
+        captured["batch_size"] = batch_size
+        return {0: "Orders"}, "llm"
+
+    monkeypatch.setattr("graphify.llm.generate_community_labels", fake_generate)
+    monkeypatch.setattr("graphify.export.to_html", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "graphify",
+            "label",
+            str(tmp_path),
+            "--backend",
+            "gemini",
+            "--model",
+            "gemini-3.1-flash-lite",
+            "--max-concurrency",
+            "8",
+            "--batch-size",
+            "50",
+            "--no-viz",
+        ],
+    )
+
+    cli.main()
+
+    # Also verifies the space-separated forms parse (the value must not be mistaken
+    # for the positional path) and reach generate_community_labels.
+    assert captured == {
+        "backend": "gemini", "model": "gemini-3.1-flash-lite",
+        "max_concurrency": 8, "batch_size": 50,
+    }
 
 
 def test_label_communities_partial_reply_fills_placeholder(monkeypatch):
@@ -210,3 +290,81 @@ def test_label_communities_max_communities_caps_total(monkeypatch):
     label_communities(G, communities, backend="gemini", max_communities=40, batch_size=100)
     # Only 40 communities should have been sent to the backend.
     assert len(captured_cids) == 40
+
+
+# --- #1390: parallel labeling (--max-concurrency) + --batch-size --------------
+
+import threading
+import time as _time
+
+
+def _many_communities(n):
+    G = nx.Graph()
+    comms = {}
+    for i in range(n):
+        nid = f"n{i}"
+        G.add_node(nid, label=f"sym_{i}")
+        comms[i] = [nid]
+    return G, comms
+
+
+def test_label_communities_parallel_matches_sequential(monkeypatch):
+    """Concurrency must not change the result: same cid->name map either way."""
+    G, communities = _many_communities(6)
+
+    def fake_batch(batch_cids, batch_lines, *, backend, model=None):
+        return {cid: f"name-{cid}" for cid in batch_cids}
+
+    monkeypatch.setattr("graphify.llm._label_batch_with_retry", fake_batch)
+    seq = label_communities(G, communities, backend="gemini", batch_size=1, max_concurrency=1)
+    par = label_communities(G, communities, backend="gemini", batch_size=1, max_concurrency=4)
+    assert seq == par == {i: f"name-{i}" for i in range(6)}
+
+
+def test_label_communities_batch_size_controls_batch_count(monkeypatch):
+    G, communities = _many_communities(5)
+    calls = []
+
+    def fake_batch(batch_cids, batch_lines, *, backend, model=None):
+        calls.append(list(batch_cids))
+        return {cid: f"n-{cid}" for cid in batch_cids}
+
+    monkeypatch.setattr("graphify.llm._label_batch_with_retry", fake_batch)
+    labels = label_communities(G, communities, backend="gemini", batch_size=2, max_concurrency=1)
+    assert len(calls) == 3                       # 5 communities / batch 2 -> 3 batches
+    assert sum(len(c) for c in calls) == 5
+    assert labels == {i: f"n-{i}" for i in range(5)}
+
+
+def _peak_tracker():
+    lock = threading.Lock()
+    state = {"now": 0, "peak": 0}
+
+    def fake_batch(batch_cids, batch_lines, *, backend, model=None):
+        with lock:
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+        _time.sleep(0.03)
+        with lock:
+            state["now"] -= 1
+        return {cid: f"n-{cid}" for cid in batch_cids}
+
+    return fake_batch, state
+
+
+def test_label_communities_runs_batches_concurrently(monkeypatch):
+    G, communities = _many_communities(8)
+    fake_batch, state = _peak_tracker()
+    monkeypatch.setattr("graphify.llm._label_batch_with_retry", fake_batch)
+    label_communities(G, communities, backend="gemini", batch_size=1, max_concurrency=4)
+    assert state["peak"] > 1, "batches should run in parallel with max_concurrency>1"
+
+
+def test_label_communities_forces_serial_for_ollama(monkeypatch):
+    """ollama/claude-cli must stay serial regardless of --max-concurrency."""
+    G, communities = _many_communities(8)
+    fake_batch, state = _peak_tracker()
+    monkeypatch.setattr("graphify.llm._label_batch_with_retry", fake_batch)
+    monkeypatch.delenv("GRAPHIFY_OLLAMA_PARALLEL", raising=False)
+    label_communities(G, communities, backend="ollama", batch_size=1, max_concurrency=8)
+    assert state["peak"] == 1, "ollama must be forced serial"

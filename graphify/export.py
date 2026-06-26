@@ -481,7 +481,7 @@ def _git_head() -> str | None:
         return None
 
 
-def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None) -> bool:
+def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *, force: bool = False, built_at_commit: str | None = None, community_labels: dict[int, str] | None = None) -> bool:
     # Safety check: refuse to silently shrink an existing graph (#479)
     existing_path = Path(output_path)
     if not force and existing_path.exists():
@@ -508,12 +508,16 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
             pass  # unreadable existing file — proceed with write
 
     node_community = _node_community_map(communities)
+    _labels: dict[int, str] = {int(k): v for k, v in (community_labels or {}).items()}
     try:
         data = json_graph.node_link_data(G, edges="links")
     except TypeError:
         data = json_graph.node_link_data(G)
     for node in data["nodes"]:
-        node["community"] = node_community.get(node["id"])
+        cid = node_community.get(node["id"])
+        node["community"] = cid
+        if cid is not None and _labels:
+            node["community_name"] = _labels.get(cid, f"Community {cid}")
         node["norm_label"] = _strip_diacritics(node.get("label", "")).lower()
     for link in data["links"]:
         if "confidence_score" not in link:
@@ -836,6 +840,28 @@ def _cap_filename(s: str, limit: int = 200) -> str:
     return f"{truncated}_{digest}"
 
 
+def _dedup_node_filenames(G: nx.Graph, safe_name) -> dict[str, str]:
+    """Map each node_id to a unique note filename, appending a numeric suffix on
+    collision. The collision set is keyed on the lowercased name so two labels
+    differing only by case (e.g. "References" vs "references") still get distinct
+    filenames - on case-insensitive filesystems (macOS/APFS, Windows/NTFS) they
+    would otherwise resolve to one path and silently overwrite each other on disk.
+    The suffixed candidate is itself re-checked, so a generated "base_1" never
+    silently overwrites a node whose literal label is already "base_1"."""
+    node_filenames: dict[str, str] = {}
+    used: set[str] = set()
+    for node_id, data in G.nodes(data=True):
+        base = safe_name(data.get("label", node_id))
+        candidate = base
+        n = 1
+        while candidate.lower() in used:
+            candidate = f"{base}_{n}"
+            n += 1
+        used.add(candidate.lower())
+        node_filenames[node_id] = candidate
+    return node_filenames
+
+
 def to_obsidian(
     G: nx.Graph,
     communities: dict[int, list[str]],
@@ -862,18 +888,16 @@ def to_obsidian(
         cleaned = re.sub(r'[\\/*?:"<>|#^[\]]', "", label.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")).strip()
         # Strip trailing .md/.mdx/.markdown so "CLAUDE.md" doesn't become "CLAUDE.md.md"
         cleaned = re.sub(r"\.(md|mdx|qmd|markdown)$", "", cleaned, flags=re.IGNORECASE)
-        return _cap_filename(cleaned) if cleaned else "unnamed"
+        # A stem of only punctuation (e.g. "@", "*", "#") survives the unsafe-char
+        # strip above but is empty once a downstream tool re-slugs on word chars
+        # (e.g. qmd's handelize() reduces "@" -> "" and raises, aborting the whole
+        # `qmd update`). Require at least one word char; else fall back so we never
+        # emit a "@.md"-style filename. (#1409)
+        if not re.search(r"\w", cleaned, flags=re.UNICODE):
+            return "unnamed"
+        return _cap_filename(cleaned)
 
-    node_filename: dict[str, str] = {}
-    seen_names: dict[str, int] = {}
-    for node_id, data in G.nodes(data=True):
-        base = safe_name(data.get("label", node_id))
-        if base in seen_names:
-            seen_names[base] += 1
-            node_filename[node_id] = f"{base}_{seen_names[base]}"
-        else:
-            seen_names[base] = 0
-            node_filename[node_id] = base
+    node_filename = _dedup_node_filenames(G, safe_name)
 
     # Helper: compute dominant confidence for a node across all its edges
     def _dominant_confidence(node_id: str) -> str:
@@ -971,13 +995,39 @@ def to_obsidian(
         }
         return len(neighbor_cids)
 
-    community_notes_written = 0
-    for cid, members in communities.items():
-        community_name = (
+    def _community_name(cid) -> str:
+        return (
             community_labels.get(cid, f"Community {cid}")
             if community_labels and cid is not None
             else f"Community {cid}"
         )
+
+    # One case-folded-deduped filename per community, computed once so the note we
+    # write and every [[_COMMUNITY_...]] cross-reference resolve to the same file.
+    # Two community labels differing only by case (e.g. LLM labels "API" vs "Api")
+    # would otherwise overwrite each other on case-insensitive filesystems - and
+    # this path had no dedup at all, so even same-case duplicate labels collided.
+    community_filename: dict = {}
+    used_community: set[str] = set()
+    for cid in communities:
+        base = f"_COMMUNITY_{safe_name(_community_name(cid))}"
+        candidate = base
+        n = 1
+        while candidate.lower() in used_community:
+            candidate = f"{base}_{n}"
+            n += 1
+        used_community.add(candidate.lower())
+        community_filename[cid] = candidate
+
+    community_notes_written = 0
+    for cid, all_members in communities.items():
+        community_name = _community_name(cid)
+        # A community's member list can contain ids with no backing node in G
+        # (e.g. pruned nodes, stale community assignments from a prior run, or
+        # synthesized/merge-artifact ids). Dereferencing those via G.nodes[n] or
+        # node_filename[n] raises KeyError and aborts the whole vault export, so
+        # skip dangling members rather than crashing (issue #1236).
+        members = [m for m in all_members if m in G and m in node_filename]
         n_members = len(members)
         coh_value = cohesion.get(cid) if cohesion else None
 
@@ -1035,13 +1085,8 @@ def to_obsidian(
         if cross:
             lines.append("## Connections to other communities")
             for other_cid, edge_count in sorted(cross.items(), key=lambda x: -x[1]):
-                other_name = (
-                    community_labels.get(other_cid, f"Community {other_cid}")
-                    if community_labels and other_cid is not None
-                    else f"Community {other_cid}"
-                )
-                other_safe = safe_name(other_name)
-                lines.append(f"- {edge_count} edge{'s' if edge_count != 1 else ''} to [[_COMMUNITY_{other_safe}]]")
+                other_fname = community_filename.get(other_cid) or f"_COMMUNITY_{safe_name(_community_name(other_cid))}"
+                lines.append(f"- {edge_count} edge{'s' if edge_count != 1 else ''} to [[{other_fname}]]")
             lines.append("")
 
         # Top bridge nodes - highest degree nodes that connect to other communities
@@ -1061,8 +1106,7 @@ def to_obsidian(
                     f"{'community' if reach == 1 else 'communities'}"
                 )
 
-        community_safe = safe_name(community_name)
-        fname = f"_COMMUNITY_{community_safe}.md"
+        fname = community_filename[cid] + ".md"
         (out / fname).write_text("\n".join(lines), encoding="utf-8")  # nosec
         community_notes_written += 1
 
@@ -1102,20 +1146,25 @@ def to_canvas(
     def safe_name(label: str) -> str:
         cleaned = re.sub(r'[\\/*?:"<>|#^[\]]', "", label.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")).strip()
         cleaned = re.sub(r"\.(md|mdx|qmd|markdown)$", "", cleaned, flags=re.IGNORECASE)
-        return _cap_filename(cleaned) if cleaned else "unnamed"
+        # A stem of only punctuation (e.g. "@", "*", "#") survives the unsafe-char
+        # strip above but is empty once a downstream tool re-slugs on word chars
+        # (e.g. qmd's handelize() reduces "@" -> "" and raises, aborting the whole
+        # `qmd update`). Require at least one word char; else fall back so we never
+        # emit a "@.md"-style filename. (#1409)
+        if not re.search(r"\w", cleaned, flags=re.UNICODE):
+            return "unnamed"
+        return _cap_filename(cleaned)
 
     # Build node_filenames if not provided (same dedup logic as to_obsidian)
     if node_filenames is None:
-        node_filenames = {}
-        seen_names: dict[str, int] = {}
-        for node_id, data in G.nodes(data=True):
-            base = safe_name(data.get("label", node_id))
-            if base in seen_names:
-                seen_names[base] += 1
-                node_filenames[node_id] = f"{base}_{seen_names[base]}"
-            else:
-                seen_names[base] = 0
-                node_filenames[node_id] = base
+        node_filenames = _dedup_node_filenames(G, safe_name)
+
+    # Fallback: with no community data (e.g. --no-cluster builds or a missing
+    # analysis sidecar) the grid below produces nothing and the canvas is written
+    # as an empty 32-byte shell on an otherwise populated graph. Emit every node
+    # into one synthetic community so the canvas always reflects the graph (#1324).
+    if not communities and G.number_of_nodes() > 0:
+        communities = {0: [str(n) for n in G.nodes()]}
 
     num_communities = len(communities)
     cols = math.ceil(math.sqrt(num_communities)) if num_communities > 0 else 1
@@ -1129,15 +1178,21 @@ def to_canvas(
     group_x_offsets: list[int] = []
     group_y_offsets: list[int] = []
 
-    # Precompute group sizes so we can calculate offsets
+    # Precompute group sizes so we can calculate offsets.
+    # inner_cols is the per-community grid width; the box dimensions AND the node
+    # placement loop below both derive from it, so the cards always fill the box
+    # instead of wrapping into a narrow strip inside an oversized box.
     sorted_cids = sorted(communities.keys())
     group_sizes: dict[int, tuple[int, int]] = {}
+    group_cols: dict[int, int] = {}
     for cid in sorted_cids:
         members = communities[cid]
         n = len(members)
-        w = max(600, 220 * math.ceil(math.sqrt(n)) if n > 0 else 600)
-        h = max(400, 100 * math.ceil(n / 3) + 120 if n > 0 else 400)
+        inner_cols = max(1, math.ceil(math.sqrt(n)))
+        w = max(600, 220 * inner_cols)
+        h = max(400, 100 * math.ceil(n / inner_cols) + 120)
         group_sizes[cid] = (w, h)
+        group_cols[cid] = inner_cols
 
     # Compute cumulative row heights and col widths for grid placement
     # Each grid cell uses the max width/height in its col/row
@@ -1201,11 +1256,13 @@ def to_canvas(
             "color": canvas_color,
         })
 
-        # Node cards inside the group - rows of 3
+        # Node cards inside the group - laid out in the same ceil(sqrt(n))-column
+        # grid the box was sized for (group_cols[cid]), so cards fill the box.
+        inner_cols = group_cols[cid]
         sorted_members = sorted(members, key=lambda n: G.nodes[n].get("label", n))
         for m_idx, node_id in enumerate(sorted_members):
-            col = m_idx % 3
-            row = m_idx // 3
+            col = m_idx % inner_cols
+            row = m_idx // inner_cols
             nx_x = gx + 20 + col * (180 + 20)
             nx_y = gy + 80 + row * (60 + 20)
             fname = node_filenames.get(node_id, safe_name(G.nodes[node_id].get("label", node_id)))
@@ -1311,6 +1368,102 @@ def push_to_neo4j(
             edges_pushed += 1
 
     driver.close()
+    return {"nodes": nodes_pushed, "edges": edges_pushed}
+
+
+def push_to_falkordb(
+    G: nx.Graph,
+    uri: str,
+    user: str | None = None,
+    password: str | None = None,
+    communities: dict[int, list[str]] | None = None,
+    graph_name: str = "graphify",
+) -> dict[str, int]:
+    """Push graph directly to a running FalkorDB instance via the Python SDK.
+
+    Requires: pip install falkordb
+
+    FalkorDB is OpenCypher-compatible, so the MERGE/SET upsert queries are
+    identical to push_to_neo4j. Differences from the Neo4j path:
+      - connects with FalkorDB(host, port, username, password) instead of a bolt
+        driver; only the host/port are read from the URI, so the scheme is
+        informational - "falkordb://localhost:6379", "redis://localhost:6379"
+        and a bare "localhost:6379" are all equivalent (default port 6379).
+      - a named graph is selected via db.select_graph(graph_name) (default
+        "graphify"); FalkorDB keys each graph by name in the same instance.
+      - queries run via graph.query(cypher, params) - there is no session object.
+      - auth is optional (FalkorDB runs without credentials by default), so user
+        and password may be None.
+      - no APOC: the Neo4j path does not use APOC either, so nothing to port.
+
+    Uses MERGE so re-running is safe - nodes and edges are upserted, not
+    duplicated. Returns a dict with counts of nodes and edges pushed.
+    """
+    try:
+        from falkordb import FalkorDB
+    except ImportError as e:
+        raise ImportError(
+            "falkordb SDK not installed. Run: pip install falkordb"
+        ) from e
+
+    from urllib.parse import urlparse
+
+    node_community = _node_community_map(communities) if communities else {}
+
+    def _safe_rel(relation: str) -> str:
+        return re.sub(r"[^A-Z0-9_]", "_", relation.upper().replace(" ", "_").replace("-", "_")) or "RELATED_TO"
+
+    def _safe_label(label: str) -> str:
+        """Sanitize a FalkorDB node label to prevent Cypher injection."""
+        sanitized = re.sub(r"[^A-Za-z0-9_]", "", label)
+        return sanitized if sanitized else "Entity"
+
+    parsed = urlparse(uri if "://" in uri else f"redis://{uri}")
+    # FalkorDB auth is optional. Only send credentials when a password is
+    # provided; otherwise connect anonymously and ignore any bolt-style default
+    # username (e.g. Neo4j's "neo4j"), which FalkorDB rejects as an unknown ACL
+    # user. Credentials embedded in the URI take precedence over the args.
+    connect_user = parsed.username or (user if password else None)
+    connect_password = parsed.password or (password or None)
+    db = FalkorDB(
+        host=parsed.hostname or "localhost",
+        port=parsed.port or 6379,
+        username=connect_user,
+        password=connect_password,
+    )
+    graph = db.select_graph(graph_name)
+    nodes_pushed = 0
+    edges_pushed = 0
+
+    for node_id, data in G.nodes(data=True):
+        props = {
+            k: v for k, v in data.items()
+            if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
+        }
+        props["id"] = node_id
+        cid = node_community.get(node_id)
+        if cid is not None:
+            props["community"] = cid
+        ftype = _safe_label(data.get("file_type", "Entity").capitalize())
+        graph.query(
+            f"MERGE (n:{ftype} {{id: $id}}) SET n += $props",
+            {"id": node_id, "props": props},
+        )
+        nodes_pushed += 1
+
+    for u, v, data in G.edges(data=True):
+        rel = _safe_rel(data.get("relation", "RELATED_TO"))
+        props = {
+            k: v for k, v in data.items()
+            if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
+        }
+        graph.query(
+            f"MATCH (a {{id: $src}}), (b {{id: $tgt}}) "
+            f"MERGE (a)-[r:{rel}]->(b) SET r += $props",
+            {"src": u, "tgt": v, "props": props},
+        )
+        edges_pushed += 1
+
     return {"nodes": nodes_pushed, "edges": edges_pushed}
 
 

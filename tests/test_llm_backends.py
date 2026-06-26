@@ -66,14 +66,46 @@ def test_extract_files_direct_routes_gemini_through_openai_compat(tmp_path, monk
     with patch("graphify.llm._call_openai_compat", return_value=result) as call:
         assert llm.extract_files_direct([source], backend="gemini", root=tmp_path) is result
 
-    assert call.call_args.args[:4] == (
+    assert call.call_args.args[:3] == (
         "https://generativelanguage.googleapis.com/v1beta/openai/",
         "google-key",
         "gemini-3-flash-preview",
-        "=== note.md ===\n# Architecture\n\nThe runner emits a snapshot.\n",
     )
+    # Source content is wrapped in an untrusted_source delimiter block (#1210)
+    # rather than the old `=== path ===` separator.
+    user_msg = call.call_args.args[3]
+    assert '<untrusted_source path="note.md" sha256=' in user_msg
+    assert "# Architecture\n\nThe runner emits a snapshot." in user_msg
+    assert user_msg.rstrip().endswith("</untrusted_source>")
     assert call.call_args.kwargs["temperature"] == 0
     assert call.call_args.kwargs["reasoning_effort"] == "low"
+    assert call.call_args.kwargs["max_completion_tokens"] == 16384
+
+
+@pytest.mark.parametrize(
+    "backend, env_key",
+    [
+        ("ollama", "OLLAMA_API_KEY"),
+        ("deepseek", "DEEPSEEK_API_KEY"),
+        ("openai", "OPENAI_API_KEY"),
+        ("kimi", "MOONSHOT_API_KEY"),
+    ],
+)
+def test_openai_compat_backends_resolve_full_output_cap(tmp_path, monkeypatch, backend, env_key):
+    # #1365: these configs define `max_tokens: 16384`, but the dispatch used to
+    # read only the `max_completion_tokens` key (which only gemini sets), so the
+    # output cap silently fell back to 8192 and truncated deep-mode JSON. The
+    # dispatch must resolve their configured 16384.
+    _clear_backend_env(monkeypatch)
+    monkeypatch.delenv("GRAPHIFY_MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.setenv(env_key, "test-key")
+    source = tmp_path / "note.md"
+    source.write_text("# Architecture\n")
+    result = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1}
+
+    with patch("graphify.llm._call_openai_compat", return_value=result) as call:
+        llm.extract_files_direct([source], backend=backend, root=tmp_path)
+
     assert call.call_args.kwargs["max_completion_tokens"] == 16384
 
 
@@ -98,6 +130,78 @@ def test_missing_gemini_key_names_both_supported_env_vars(monkeypatch):
         llm.extract_files_direct([Path("missing.md")], backend="gemini")
 
     assert "GEMINI_API_KEY or GOOGLE_API_KEY" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# #1386: public entry points accept str paths, not just pathlib.Path
+# ---------------------------------------------------------------------------
+
+
+def test_extract_files_direct_accepts_str_paths(tmp_path, monkeypatch):
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+    source = tmp_path / "note.md"
+    source.write_text("# Architecture\n\nThe runner emits a snapshot.\n")
+    result = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1}
+
+    # str path must not raise AttributeError: 'str' object has no attribute 'suffix'
+    with patch("graphify.llm._call_openai_compat", return_value=result):
+        assert llm.extract_files_direct([str(source)], backend="gemini", root=tmp_path) is result
+
+
+def test_extract_corpus_parallel_accepts_str_and_mixed_paths(tmp_path, monkeypatch):
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+    f1 = tmp_path / "a.md"
+    f1.write_text("# A\n\nNode one.\n")
+    f2 = tmp_path / "b.md"
+    f2.write_text("# B\n\nNode two.\n")
+    result = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1}
+
+    with patch("graphify.llm._call_openai_compat", return_value=result):
+        # all-str, all-Path, and mixed must each pack + run without AttributeError
+        for files in ([str(f1), str(f2)], [f1, f2], [str(f1), f2]):
+            merged = llm.extract_corpus_parallel(
+                files, backend="gemini", root=tmp_path, max_concurrency=1
+            )
+            assert merged["failed_chunks"] == 0
+
+
+def test_corpus_parallel_oversized_markdown_does_not_crash_on_fileslice(tmp_path, monkeypatch):
+    # #1397/#1399 regression: a Markdown file large enough to be sliced into
+    # FileSlice units must not crash extract_files_direct's Path() coercion
+    # (#1386). The earlier str-path tests used tiny files, so slicing never ran.
+    from graphify.llm import _FILE_CHAR_CAP
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+    big = tmp_path / "big.md"
+    big.write_text(("# Section\n\n" + "lorem ipsum dolor sit amet " * 60 + "\n\n") * 30)
+    assert len(big.read_text()) > _FILE_CHAR_CAP  # guarantees slicing kicks in
+    result = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1}
+
+    with patch("graphify.llm._call_openai_compat", return_value=result):
+        # both a str path and a FileSlice unit must flow through without TypeError
+        merged = llm.extract_corpus_parallel(
+            [str(big)], backend="gemini", root=tmp_path, max_concurrency=1
+        )
+    assert merged["failed_chunks"] == 0  # no chunk raised Path(FileSlice) TypeError
+
+
+def test_str_path_entry_points_handle_edge_cases(tmp_path, monkeypatch):
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-key")
+    result = {"nodes": [], "edges": [], "hyperedges": [], "input_tokens": 1, "output_tokens": 1}
+
+    with patch("graphify.llm._call_openai_compat", return_value=result):
+        # empty list: no chunks, nothing to extract, no crash
+        empty = llm.extract_corpus_parallel([], backend="gemini", root=tmp_path)
+        assert empty["nodes"] == [] and empty["failed_chunks"] == 0
+        # a Path subclass is still a Path and must pass through unchanged
+        class _SubPath(type(Path())):  # concrete OS-specific Path subclass
+            pass
+        sub = _SubPath(tmp_path / "c.md")
+        sub.write_text("# C\n\nNode.\n")
+        assert llm.extract_files_direct([sub], backend="gemini", root=tmp_path) is result
 
 
 # ---------------------------------------------------------------------------
@@ -645,3 +749,174 @@ def test_detect_backend_azure_requires_endpoint_not_just_key(monkeypatch):
 def test_estimate_cost_azure_no_keyerror():
     cost = llm.estimate_cost("azure", 1_000_000, 500_000)
     assert cost == pytest.approx(2.50 + 5.00)  # 1M in * $2.50/M + 0.5M out * $10.00/M
+
+
+# ---------------------------------------------------------------------------
+# Temperature resolution (#1191): omit temperature for reasoning models
+# (o1/o3/o4/gpt-5) and honour GRAPHIFY_LLM_TEMPERATURE.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["o1", "o1-preview", "o1-mini", "o3", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini", "openai/o3-mini"],
+)
+def test_model_requires_default_temperature_true_for_reasoning_models(model):
+    assert llm._model_requires_default_temperature(model) is True
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-4.1-mini", "gpt-4o", "gpt-4.1", "kimi-k2.6", "deepseek-v4-flash", "", "o1x", "go3"],
+)
+def test_model_requires_default_temperature_false_for_normal_models(model):
+    assert llm._model_requires_default_temperature(model) is False
+
+
+def test_resolve_temperature_default_for_normal_model(monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_LLM_TEMPERATURE", raising=False)
+    assert llm._resolve_temperature(0, "gpt-4.1-mini") == 0
+
+
+def test_resolve_temperature_omitted_for_reasoning_model(monkeypatch):
+    monkeypatch.delenv("GRAPHIFY_LLM_TEMPERATURE", raising=False)
+    assert llm._resolve_temperature(0, "o3-mini") is None
+    assert llm._resolve_temperature(0, "gpt-5") is None
+
+
+def test_resolve_temperature_env_var_numeric_overrides(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_LLM_TEMPERATURE", "0.7")
+    assert llm._resolve_temperature(0, "gpt-4.1-mini") == 0.7
+    # env var wins even for a reasoning model (explicit user choice)
+    assert llm._resolve_temperature(0, "o3-mini") == 0.7
+
+
+def test_resolve_temperature_env_var_none_omits(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_LLM_TEMPERATURE", "none")
+    assert llm._resolve_temperature(0, "gpt-4.1-mini") is None
+
+
+def test_resolve_temperature_env_var_invalid_falls_back(monkeypatch):
+    monkeypatch.setenv("GRAPHIFY_LLM_TEMPERATURE", "hot")
+    # bad value -> backend default for a normal model, still omitted for reasoning
+    assert llm._resolve_temperature(0, "gpt-4.1-mini") == 0
+    assert llm._resolve_temperature(0, "o3-mini") is None
+
+
+def test_openai_compat_omits_temperature_for_o3_model(tmp_path, monkeypatch):
+    # Regression for #1191: with a reasoning model the request must not carry a
+    # `temperature` key at all, or the API returns HTTP 400.
+    _clear_backend_env(monkeypatch)
+    monkeypatch.delenv("GRAPHIFY_LLM_TEMPERATURE", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("GRAPHIFY_OPENAI_MODEL", "o3-mini")
+    captured = _install_capturing_openai(monkeypatch)
+    (tmp_path / "f.py").write_text("x = 1\n")
+
+    llm.extract_files_direct([tmp_path / "f.py"], backend="openai", root=tmp_path)
+
+    assert "temperature" not in captured, (
+        "reasoning models (o3) reject an explicit temperature; it must be omitted (#1191)"
+    )
+    assert captured["model"] == "o3-mini"
+
+
+def test_openai_compat_sends_temperature_for_normal_model(tmp_path, monkeypatch):
+    _clear_backend_env(monkeypatch)
+    monkeypatch.delenv("GRAPHIFY_LLM_TEMPERATURE", raising=False)
+    monkeypatch.delenv("GRAPHIFY_OPENAI_MODEL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    captured = _install_capturing_openai(monkeypatch)
+    (tmp_path / "f.py").write_text("x = 1\n")
+
+    llm.extract_files_direct([tmp_path / "f.py"], backend="openai", root=tmp_path)
+
+    assert captured.get("temperature") == 0, "normal models keep the deterministic default"
+
+
+def test_openai_compat_env_var_temperature_applied(tmp_path, monkeypatch):
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv("GRAPHIFY_LLM_TEMPERATURE", "0.3")
+    monkeypatch.delenv("GRAPHIFY_OPENAI_MODEL", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    captured = _install_capturing_openai(monkeypatch)
+    (tmp_path / "f.py").write_text("x = 1\n")
+
+    llm.extract_files_direct([tmp_path / "f.py"], backend="openai", root=tmp_path)
+
+    assert captured.get("temperature") == 0.3
+
+
+def test_native_extraction_prompt_requests_hyperedges():
+    """The native-backend prompt must request hyperedges, like the skill's
+    extraction-spec does — otherwise `graphify extract --backend X` silently
+    produces zero hyperedges while the agent path produces them. Guards against
+    the two prompts drifting apart again.
+    """
+    for deep in (False, True):
+        prompt = llm._extraction_system(deep=deep)
+        assert "hyperedge" in prompt.lower(), f"deep={deep}: prompt does not mention hyperedges"
+        assert "3 or more nodes" in prompt, f"deep={deep}: prompt lacks the hyperedge guidance"
+        # The schema example must show a populated hyperedge, not an empty array.
+        assert '"hyperedges":[]' not in prompt, f"deep={deep}: schema still shows empty hyperedges"
+        assert '"nodes":["node_id1"' in prompt, f"deep={deep}: schema lacks a populated hyperedge example"
+
+
+def test_native_extraction_prompt_matches_skill_spec_on_hyperedges():
+    """Both extraction paths share the same hyperedge contract (the '3 or more
+    nodes … participate together' rule), so a corpus yields the same hyperedge
+    behaviour whether built via the skill or `graphify extract --backend`.
+    """
+    spec = (
+        Path(__file__).resolve().parents[1]
+        / "tools" / "skillgen" / "fragments" / "references" / "shared" / "extraction-spec.md"
+    ).read_text(encoding="utf-8")
+    shared = "3 or more nodes clearly participate together"
+    assert shared in spec, "skill extraction-spec changed its hyperedge wording"
+    assert shared in llm._EXTRACTION_SYSTEM, "native prompt drifted from the skill hyperedge wording"
+
+
+# --- *_BASE_URL env overrides for kimi / gemini / deepseek (#1458) -------------
+# BACKENDS reads the env at import time, so each case runs in a fresh interpreter
+# (subprocess) to avoid reload contamination of the test session.
+import subprocess
+import sys as _sys
+
+
+def _backend_base_url(backend: str, env_extra: dict) -> str:
+    out = subprocess.run(
+        [_sys.executable, "-c",
+         f"import graphify.llm as l; print(l.BACKENDS[{backend!r}]['base_url'])"],
+        env={**os.environ, **env_extra}, capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip()
+
+
+import os  # noqa: E402
+
+
+@pytest.mark.parametrize("backend,env_var,override", [
+    ("kimi", "KIMI_BASE_URL", "https://proxy.example/kimi/v1"),
+    ("gemini", "GEMINI_BASE_URL", "https://proxy.example/gemini"),
+    ("deepseek", "DEEPSEEK_BASE_URL", "https://proxy.example/deepseek"),
+])
+def test_base_url_env_overrides(backend, env_var, override):
+    assert _backend_base_url(backend, {env_var: override}) == override
+
+
+@pytest.mark.parametrize("backend,default", [
+    ("kimi", "https://api.moonshot.ai/v1"),
+    ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+    ("deepseek", "https://api.deepseek.com"),
+])
+def test_base_url_defaults_without_env(backend, default):
+    # Ensure the override env vars are unset so the hardcoded default is used.
+    cleared = {k: "" for k in ("KIMI_BASE_URL", "GEMINI_BASE_URL", "DEEPSEEK_BASE_URL")}
+    # empty string would be falsy-but-set; delete instead by reconstructing env without them
+    env = {k: v for k, v in os.environ.items() if k not in cleared}
+    out = subprocess.run(
+        [_sys.executable, "-c",
+         f"import graphify.llm as l; print(l.BACKENDS[{backend!r}]['base_url'])"],
+        env=env, capture_output=True, text=True, check=True,
+    )
+    assert out.stdout.strip() == default

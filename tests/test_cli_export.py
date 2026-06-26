@@ -154,6 +154,19 @@ def test_export_neo4j_creates_cypher(tmp_path):
     assert "MERGE" in content or "CREATE" in content
 
 
+# ── graphify export falkordb (cypher) ────────────────────────────────────────
+
+def test_export_falkordb_creates_cypher(tmp_path):
+    _make_graph(tmp_path)
+    r = _run(["export", "falkordb"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    cypher = tmp_path / "graphify-out" / "cypher.txt"
+    assert cypher.exists()
+    assert cypher.stat().st_size > 0
+    content = cypher.read_text()
+    assert "MERGE" in content or "CREATE" in content
+
+
 # ── graphify query ───────────────────────────────────────────────────────────
 
 def test_query_returns_output(tmp_path):
@@ -191,6 +204,26 @@ def test_query_uses_graphify_out_env(tmp_path):
 
     assert r.returncode == 0, r.stderr
     assert len(r.stdout) > 0
+
+
+def test_extract_writes_to_graphify_out_env(tmp_path):
+    """#1423: `graphify extract` honours GRAPHIFY_OUT for where it WRITES, not only
+    where readers look — previously it hardcoded graphify-out/ and ignored the
+    override. Code-only corpus, so no LLM backend is needed."""
+    (tmp_path / "m.py").write_text("def a():\n    return b()\n\n\ndef b():\n    return 1\n")
+    env = os.environ.copy()
+    env["GRAPHIFY_OUT"] = "custom-out"
+
+    r = _run(["extract", "."], tmp_path, env=env)
+
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / "custom-out" / "graph.json").exists(), r.stdout
+    assert (tmp_path / "custom-out" / "manifest.json").exists()
+    # The default dir must NOT be created when the override is set.
+    assert not (tmp_path / "graphify-out").exists(), "extract ignored GRAPHIFY_OUT and wrote graphify-out/"
+    # Manifest keys are relative to the scan root (portable) — #1417.
+    keys = list(json.loads((tmp_path / "custom-out" / "manifest.json").read_text()).keys())
+    assert keys == ["m.py"], keys
 
 
 # ── graphify path ────────────────────────────────────────────────────────────

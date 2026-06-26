@@ -1,4 +1,4 @@
-"""Tests for language extractors: Java, C, C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Go, Julia, Fortran, JS/TS, .NET project files."""
+"""Tests for language extractors: Java, C, C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Go, Julia, Fortran, JS/TS, .NET project files, XAML."""
 from __future__ import annotations
 from pathlib import Path
 import pytest
@@ -6,9 +6,10 @@ from graphify.extract import (
     extract_java, extract_c, extract_cpp, extract_ruby,
     extract_csharp, extract_kotlin, extract_scala, extract_php,
     extract_swift, extract_go, extract_julia, extract_js, extract_fortran,
-    extract_groovy, extract_sln, extract_csproj, extract_razor,
+    extract_groovy, extract_sln, extract_csproj, extract_xaml, extract_razor,
     extract_dm, extract_dmi, extract_dmm, extract_dmf,
-    extract_powershell, extract_apex,
+    extract_powershell, extract_apex, extract_verilog,
+    extract_powershell_manifest,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -224,6 +225,36 @@ def test_cpp_struct_inherits_edge():
         for e in r["edges"] if e["relation"] == "inherits"
     )
     assert found, "RetryingHttpClient (struct) should have inherits edge to HttpClient"
+
+
+# ── CUDA ──────────────────────────────────────────────────────────────────────
+# CUDA is a C++ superset, so .cu/.cuh route through the C++ (tree-sitter-cpp)
+# extractor. These tests guard that __global__/__device__ kernels, host
+# functions, structs and includes are all extracted.
+
+def test_cuda_no_error():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    assert "error" not in r
+
+def test_cuda_finds_kernel_and_device_functions():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    labels = _labels(r)
+    assert any("saxpy" in l for l in labels)   # __global__ kernel
+    assert any("dot" in l for l in labels)     # __device__ function
+
+def test_cuda_finds_struct():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    assert any("Vec3" in l for l in _labels(r))
+
+def test_cuda_finds_includes():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    assert "imports" in _relations(r)
+
+def test_cuda_host_call_edges():
+    r = extract_cpp(FIXTURES / "sample.cu")
+    calls = _calls(r)
+    assert ("host_norm()", "dot()") in calls
+    assert ("main()", "host_norm()") in calls
 
 
 # ── Ruby ─────────────────────────────────────────────────────────────────────
@@ -596,6 +627,31 @@ def test_swift_no_dangling_edges():
     node_ids = {n["id"] for n in r["nodes"]}
     for e in r["edges"]:
         assert e["source"] in node_ids
+        # #1327: targets must resolve to a node too, else build.py prunes the edge.
+        assert e["target"] in node_ids, f"dangling target {e['target']} ({e['relation']})"
+
+
+def test_swift_imports_survive_build():
+    # #1327: `import Foundation` / `import UIKit` previously emitted edges to bare
+    # module ids with no backing node, so build.py dropped 100% of Swift imports.
+    from graphify.build import build_from_json
+    r = extract_swift(FIXTURES / "sample.swift")
+    import_edges = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert import_edges, "extractor should emit Swift import edges"
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in import_edges:
+        assert e["target"] in node_ids  # synthesized module node exists
+    # Imported modules are tagged type=module (anchor nodes, #1327/#1330).
+    module_labels = {n["label"] for n in r["nodes"] if n.get("type") == "module"}
+    assert {"Foundation", "UIKit"} <= module_labels
+    # No private bookkeeping key should leak into output edges.
+    assert all("_import_label" not in e for e in r["edges"])
+    # Edges must survive the build (which prunes edges with unknown endpoints).
+    G = build_from_json(r)
+    surviving = [
+        (u, v) for u, v, d in G.edges(data=True) if d.get("relation") == "imports"
+    ]
+    assert surviving, "Swift import edges must survive build_from_json (#1327)"
 
 def test_swift_finds_actor():
     r = extract_swift(FIXTURES / "sample.swift")
@@ -1005,6 +1061,20 @@ def test_powershell_no_error():
     assert "error" not in r
 
 
+def test_powershell_psm1_dispatched_and_extracted(tmp_path):
+    # #1315: .psm1 modules were never indexed — no dispatch entry, no CODE_EXTENSIONS.
+    from graphify.extract import _get_extractor
+    mod = tmp_path / "Utils.psm1"
+    mod.write_text(
+        "function Get-Greeting { param([string]$Name) return \"Hi $Name\" }\n",
+        encoding="utf-8",
+    )
+    assert _get_extractor(mod) is extract_powershell
+    r = extract_powershell(mod)
+    assert "error" not in r
+    assert any("Get-Greeting" in n["label"] for n in r["nodes"])
+
+
 def test_powershell_finds_class_and_method():
     r = extract_powershell(FIXTURES / "sample.ps1")
     labels = [n["label"] for n in r["nodes"]]
@@ -1022,6 +1092,146 @@ def test_powershell_method_parameter_and_return_type_contexts():
     assert ("Transform", "string") in _edge_labels(r, "references", "parameter_type")
     assert ("Transform", "string") in _edge_labels(r, "references", "return_type")
     assert ("Save", "void") in _edge_labels(r, "references", "return_type")
+
+
+# ── PowerShell: Import-Module + dot-source (#1331) ───────────────────────────
+
+def test_powershell_import_module_emits_edge():
+    """Import-Module Foo at top level emits an imports_from edge."""
+    r = extract_powershell(FIXTURES / "sample_import.ps1")
+    assert "error" not in r
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("foo" in t for t in targets), f"Missing Import-Module Foo edge; targets={targets}"
+
+
+def test_powershell_import_module_with_name_param():
+    """Import-Module -Name Bar.psm1 resolves to module stem 'bar'."""
+    r = extract_powershell(FIXTURES / "sample_import.ps1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("bar" in t for t in targets), f"Missing Import-Module -Name Bar edge; targets={targets}"
+
+
+def test_powershell_dot_source_forward_slash_emits_edge():
+    """Dot-source `. ./Shared.psm1` emits an imports_from edge."""
+    r = extract_powershell(FIXTURES / "sample_import.ps1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("shared" in t for t in targets), f"Missing dot-source Shared edge; targets={targets}"
+
+
+def test_powershell_dot_source_backslash_emits_edge():
+    """Dot-source `. .\\Utils.ps1` (backslash path) emits an imports_from edge."""
+    r = extract_powershell(FIXTURES / "sample_import.ps1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("utils" in t for t in targets), f"Missing dot-source Utils edge; targets={targets}"
+
+
+def test_powershell_import_module_inside_function_emits_edge():
+    """Import-Module inside a function body still produces an imports_from edge."""
+    r = extract_powershell(FIXTURES / "sample_import.ps1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("innermod" in t for t in targets), (
+        f"Missing Import-Module InnerMod edge from function body; targets={targets}"
+    )
+
+
+def test_powershell_import_module_not_a_raw_call():
+    """Import-Module must not appear in raw_calls (it is an import, not a function call)."""
+    r = extract_powershell(FIXTURES / "sample_import.ps1")
+    import_module_calls = [
+        rc for rc in r.get("raw_calls", [])
+        if rc.get("callee", "").lower() == "import-module"
+    ]
+    assert not import_module_calls, (
+        f"Import-Module appeared in raw_calls but should be emitted as import edge: {import_module_calls}"
+    )
+
+
+def test_powershell_dot_source_inside_function_emits_edge():
+    """Dot-source inside a function body still produces an imports_from edge."""
+    r = extract_powershell(FIXTURES / "sample_import.ps1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("innershared" in t for t in targets), (
+        f"Missing dot-source InnerShared edge from function body; targets={targets}"
+    )
+
+
+# ── PowerShell manifest (.psd1) (#1331) ──────────────────────────────────────
+
+def test_powershell_psd1_dispatched():
+    """_get_extractor should route .psd1 to extract_powershell_manifest."""
+    from graphify.extract import _get_extractor
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(suffix=".psd1", delete=False) as f:
+        f.write(b"@{ RootModule = 'X.psm1' }")
+        path = f.name
+    try:
+        assert _get_extractor(Path(path)) is extract_powershell_manifest
+    finally:
+        os.unlink(path)
+
+
+def test_powershell_psd1_no_error():
+    r = extract_powershell_manifest(FIXTURES / "sample.psd1")
+    assert "error" not in r
+
+
+def test_powershell_psd1_has_file_node():
+    r = extract_powershell_manifest(FIXTURES / "sample.psd1")
+    assert any("sample.psd1" in n["label"] for n in r["nodes"]), (
+        f"Missing file node for sample.psd1; nodes={[n['label'] for n in r['nodes']]}"
+    )
+
+
+def test_powershell_psd1_root_module():
+    """RootModule = 'MyModule.psm1' produces an imports_from edge to 'mymodule'."""
+    r = extract_powershell_manifest(FIXTURES / "sample.psd1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("mymodule" in t for t in targets), (
+        f"Missing RootModule edge for MyModule; targets={targets}"
+    )
+
+
+def test_powershell_psd1_nested_modules():
+    """NestedModules = @('Helpers.psm1', 'Logger.psm1') produces edges for both."""
+    r = extract_powershell_manifest(FIXTURES / "sample.psd1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("helpers" in t for t in targets), f"Missing NestedModules Helpers edge; targets={targets}"
+    assert any("logger" in t for t in targets), f"Missing NestedModules Logger edge; targets={targets}"
+
+
+def test_powershell_psd1_required_modules_string():
+    """RequiredModules string form 'PSReadLine' produces an imports_from edge."""
+    r = extract_powershell_manifest(FIXTURES / "sample.psd1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("psreadline" in t for t in targets), (
+        f"Missing RequiredModules PSReadLine edge; targets={targets}"
+    )
+
+
+def test_powershell_psd1_required_modules_hashtable():
+    """RequiredModules hashtable form @{{ ModuleName='Pester' }} produces an imports_from edge."""
+    r = extract_powershell_manifest(FIXTURES / "sample.psd1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert any("pester" in t for t in targets), (
+        f"Missing RequiredModules Pester (hashtable form) edge; targets={targets}"
+    )
+
+
+def test_powershell_psd1_no_moduleversion_as_edge():
+    """ModuleVersion values ('5.0', '1.0.0') must NOT appear as import targets."""
+    r = extract_powershell_manifest(FIXTURES / "sample.psd1")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "imports_from"}
+    assert not any(t in targets for t in ("5_0", "1_0_0", "5.0", "1.0.0")), (
+        f"ModuleVersion string leaked into import targets: {targets}"
+    )
+
+
+def test_powershell_psd1_no_dangling_edges():
+    """All imports_from edge sources must exist in the node set."""
+    r = extract_powershell_manifest(FIXTURES / "sample.psd1")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"Dangling source in edge: {e}"
 
 
 # ── TypeScript dynamic imports ───────────────────────────────────────────────
@@ -1239,6 +1449,68 @@ def test_markdown_no_dangling_edges():
     node_ids = {n["id"] for n in r["nodes"]}
     for e in r["edges"]:
         assert e["source"] in node_ids, f"Dangling source: {e}"
+
+
+def _md_link_fixture(tmp_path):
+    """A hub doc linking to sibling docs, plus those docs (#1376)."""
+    pkg = tmp_path / "packages" / "coding-standards-csharp"
+    pkg.mkdir(parents=True)
+    (pkg / "index.md").write_text(
+        "# C# Coding Standards\n\n"
+        "| Topic | Doc |\n| --- | --- |\n"
+        "| Repository | [C# Repository Standards](./repository.md) |\n"
+        "| HTTP Client | [C# HTTP Client Standards](http-client.md) |\n"
+        "| Unit Tests | [C# Unit Test Standards](unit-tests.md) |\n\n"
+        "See also [external](https://example.com/x) and ![logo](./logo.png).\n"
+        "Anchor: [section](./repository.md#setup).\n"
+        "Wikilink: [[http-client]].\n"
+    )
+    (pkg / "repository.md").write_text("# C# Repository Standards\nContent.\n")
+    (pkg / "http-client.md").write_text("# C# HTTP Client Standards\nContent.\n")
+    (pkg / "unit-tests.md").write_text("# C# Unit Test Standards\nContent.\n")
+    return pkg
+
+
+def test_markdown_link_edges_emitted(tmp_path):
+    """Inline/wikilink markdown links to sibling docs become references edges (#1376)."""
+    pkg = _md_link_fixture(tmp_path)
+    r = extract_markdown(pkg / "index.md")
+    refs = [e for e in r["edges"] if e["relation"] == "references"]
+    targets = {e["target"] for e in refs}
+    # repository, http-client, unit-tests — each exactly once (deduped despite
+    # the anchor link and wikilink pointing at repository/http-client again).
+    assert len(refs) == 3, f"expected 3 reference edges, got {refs}"
+    assert any("repository" in t for t in targets)
+    assert any("http_client" in t for t in targets)
+    assert any("unit_tests" in t for t in targets)
+
+
+def test_markdown_link_skips_external_and_images(tmp_path):
+    """External URLs, in-page anchors and images must not produce edges (#1376)."""
+    pkg = _md_link_fixture(tmp_path)
+    r = extract_markdown(pkg / "index.md")
+    refs = [e for e in r["edges"] if e["relation"] == "references"]
+    for e in refs:
+        assert "example.com" not in e["target"]
+        assert "logo" not in e["target"]
+
+
+def test_markdown_link_edges_resolve_to_real_nodes(tmp_path):
+    """End-to-end: after extract()'s ID remap, link targets are real doc nodes,
+    so the hub doc gains edges into existing nodes instead of ghost nodes (#1376)."""
+    from graphify.extract import extract
+    pkg = _md_link_fixture(tmp_path)
+    paths = sorted(pkg.glob("*.md"))
+    res = extract(paths, cache_root=tmp_path, parallel=False)
+    node_ids = {n["id"] for n in res["nodes"]}
+    refs = [e for e in res["edges"] if e["relation"] == "references"]
+    assert refs, "expected reference edges after full extract"
+    for e in refs:
+        assert e["target"] in node_ids, f"link target is a ghost node: {e}"
+    # index.md must connect to all three sibling docs.
+    index_id = next(n["id"] for n in res["nodes"] if n["label"] == "index.md")
+    index_refs = {e["target"] for e in refs if e["source"] == index_id}
+    assert len(index_refs) == 3, f"hub doc under-connected: {index_refs}"
 
 
 # ── Groovy ───────────────────────────────────────────────────────────────────
@@ -1483,7 +1755,7 @@ def test_dmf_no_dangling_edges():
         assert e["target"] in node_ids
 
 
-# -- .NET project files (.sln, .csproj, .razor) -------------------------------
+# -- .NET project files (.sln, .csproj, .xaml, .razor) ------------------------
 
 def test_sln_no_error():
     r = extract_sln(FIXTURES / "sample.sln")
@@ -1525,6 +1797,12 @@ def test_csproj_finds_target_framework():
 def test_csproj_finds_sdk():
     r = extract_csproj(FIXTURES / "sample.csproj")
     assert any("Microsoft.NET.Sdk.Web" in l for l in _labels(r))
+
+def test_xaml_finds_class_and_event_references():
+    r = extract_xaml(FIXTURES / "sample.xaml")
+    assert "error" not in r
+    assert "MainWindow" in _labels(r)
+    assert any(e["relation"] == "references" and e.get("context") == "event" for e in r["edges"])
 
 def test_razor_no_error():
     r = extract_razor(FIXTURES / "sample.razor")
@@ -1628,3 +1906,52 @@ def test_apex_no_dangling_edges():
         for e in r["edges"]:
             assert e["source"] in node_ids, f"dangling source in {fixture}: {e}"
             assert e["target"] in node_ids, f"dangling target in {fixture}: {e}"
+
+
+# -- SystemVerilog -------------------------------------------------------------
+
+def test_systemverilog_no_error():
+    r = extract_verilog(FIXTURES / "sample.sv")
+    assert "error" not in r
+
+
+def test_systemverilog_splits_inherits_and_implements():
+    r = extract_verilog(FIXTURES / "sample.sv")
+    assert ("DataProcessor", "BaseProcessor") in _edge_labels(r, "inherits")
+    assert ("DataProcessor", "Processor") in _edge_labels(r, "implements")
+
+
+def test_systemverilog_field_parameter_return_and_generic_contexts():
+    r = extract_verilog(FIXTURES / "sample.sv")
+    assert ("DataProcessor", "Result") in _edge_labels(r, "references", "field")
+    assert ("DataProcessor", "Payload") in _edge_labels(r, "references", "generic_arg")
+    assert ("build", "Payload") in _edge_labels(r, "references", "parameter_type")
+    assert ("build", "Result") in _edge_labels(r, "references", "return_type")
+    assert ("build", "Payload") in _edge_labels(r, "references", "generic_arg")
+
+
+def test_systemverilog_does_not_emit_type_parameter_refs():
+    r = extract_verilog(FIXTURES / "sample.sv")
+    assert ("Result", "T") not in _edge_labels(r, "references", "field")
+
+
+def test_systemverilog_preserves_existing_module_extraction():
+    r = extract_verilog(FIXTURES / "sample.sv")
+    labels = set(_labels(r))
+    assert {"top", "leaf", "add()", "tick"}.issubset(labels)
+    assert "imports_from" in _relations(r)
+    assert "instantiates" in _relations(r)
+
+
+def test_systemverilog_missing_file_returns_empty():
+    r = extract_verilog(Path("nonexistent.sv"))
+    assert r["nodes"] == []
+    assert r["edges"] == []
+
+
+def test_systemverilog_no_dangling_edges():
+    r = extract_verilog(FIXTURES / "sample.sv")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"dangling source: {e}"
+        assert e["target"] in node_ids, f"dangling target: {e}"

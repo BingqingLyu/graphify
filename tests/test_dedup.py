@@ -208,6 +208,36 @@ def test_prefix_extension_symbols_not_merged():
         )
 
 
+def test_pass2_winner_union_does_not_pull_in_uncompared_same_label_nodes():
+    """Pass 2's winner selection must consider only the verified pair (#1247).
+
+    Picking the winner from the union of both normalized-label groups pulls
+    never-compared nodes into the merge: here A ("Session Manager", auth.md)
+    and B ("Session Manager", billing.md) are deliberately kept distinct by
+    the cross-file identical-label guards (#1046, #1178), yet when the
+    A-C fuzzy match ("Session Managr" typo) fires, _pick_winner over
+    [A, B, C] selects B (shortest id) and unions B with both A and C —
+    merging B although it was never compared against anything.
+    """
+    nodes = [
+        {"id": "session_manager_auth", "label": "Session Manager",
+         "source_file": "auth.md"},
+        {"id": "sm", "label": "Session Manager",
+         "source_file": "billing.md"},
+        {"id": "session_managr_notes", "label": "Session Managr",
+         "source_file": "notes.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    ids = {n["id"] for n in result_nodes}
+    # B must survive as a distinct node: identical label across different
+    # source files is exactly what the #1046/#1178 guards keep separate.
+    assert "sm" in ids, (
+        "uncompared cross-file node 'sm' was absorbed via pass-2 winner-union"
+    )
+    # The verified fuzzy pair (A, C) still merges — only one of them survives.
+    assert len(result_nodes) == 2
+
+
 def test_prefix_guard_does_not_block_same_length_typos():
     """The prefix-extension guard must not fire for same-length pairs — only strict
     prefix-extensions (one is a substring of the other) should be blocked (#1201).
@@ -238,3 +268,99 @@ def test_prefix_guard_fires_for_extension_pairs():
         assert hi.startswith(lo) and hi != lo, (
             f"Prefix guard should fire for ({a!r}, {b!r}) but did not"
         )
+
+
+# ── #1284: numbered siblings + cross-file file-anchored boilerplate ──────────
+
+def test_numeric_tokens_differ_helper():
+    """_numeric_tokens_differ compares digit runs as zero-padding-insensitive
+    multisets (#1284)."""
+    from graphify.dedup import _numeric_tokens_differ
+    assert _numeric_tokens_differ("adr 0011 d5 pipeline placement", "adr 0013 d4 pipeline placement")
+    assert _numeric_tokens_differ("3 1 product goals", "1 1 product goals")
+    assert _numeric_tokens_differ("code block3", "code block13")
+    assert not _numeric_tokens_differ("phase 09 overview", "phase 9 overview")  # zero-padding
+    assert not _numeric_tokens_differ("module layout wave 3", "module layouts wave 3")
+    assert not _numeric_tokens_differ("graph extractor", "graph extractar")  # digitless
+
+
+def test_dedup_does_not_merge_numbered_siblings():
+    """Long labels differing only in embedded numbers (ADR/section/issue ids)
+    must not merge — numbered siblings, not duplicates (#1284)."""
+    nodes = [
+        {"id": "n1", "label": "Pipeline placement — 4 call sites (ADR 0013 D4)",
+         "file_type": "document", "source_file": "docs/index-activity.md"},
+        {"id": "n2", "label": "Pipeline placement — 4 call sites (ADR 0011 §D5)",
+         "file_type": "document", "source_file": "docs/schema-matcher.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 2
+
+
+def test_dedup_does_not_merge_crossfile_rationale_boilerplate():
+    """Rationale nodes are file-anchored like code (#1205): parallel modules'
+    boilerplate docstrings differing by one word must not merge (#1284)."""
+    boiler = ("Django app config for {}. No business logic here. "
+              "Domain services live in services.py and adapters in providers.")
+    nodes = [
+        {"id": "r1", "label": boiler.format("apps.platform.cards"),
+         "file_type": "rationale", "source_file": "apps/platform/cards/apps.py"},
+        {"id": "r2", "label": boiler.format("apps.platform.cores"),
+         "file_type": "rationale", "source_file": "apps/platform/cores/apps.py"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 2
+
+
+def test_dedup_does_not_merge_crossfile_document_headings():
+    """Document nodes are file-anchored too: near-identical headings in different
+    files are distinct sections, not duplicates (#1284, extends the rationale guard)."""
+    nodes = [
+        {"id": "d1", "label": "Getting Started Installation Guide",
+         "file_type": "document", "source_file": "docs/a.md"},
+        {"id": "d2", "label": "Getting Started Installation Setup",
+         "file_type": "document", "source_file": "docs/b.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 2
+
+
+def test_dedup_still_merges_samefile_rationale_duplicates():
+    """The file-anchored guard only blocks cross-file pairs — near-identical
+    rationale duplicates within one file still merge (#1284 non-regression)."""
+    nodes = [
+        {"id": "r1", "label": "Counts-only metrics export, a read-only aggregation service.",
+         "file_type": "rationale", "source_file": "apps/schemas/metrics.py"},
+        {"id": "r2", "label": "Counts-only metrics export, the read-only aggregation service.",
+         "file_type": "rationale", "source_file": "apps/schemas/metrics.py"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
+
+
+# ── #1243: JaroWinkler prefix-bonus over-merge (cross-file) ──────────────────
+
+def test_dedup_does_not_merge_crossfile_shared_prefix_divergence():
+    """Cross-file labels sharing a long prefix but diverging in a distinguishing
+    token ("…jest native" vs "…react native") get JaroWinkler's prefix bonus past
+    threshold but are distinct entities; scoring them on plain Jaro blocks the
+    merge (#1243)."""
+    nodes = [
+        {"id": "p1", "label": "testing library jest native",
+         "file_type": "concept", "source_file": "pkg-a/package.json"},
+        {"id": "p2", "label": "testing library react native",
+         "file_type": "concept", "source_file": "pkg-b/package.json"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 2
+
+
+def test_dedup_still_merges_crossfile_true_duplicates():
+    """The #1243 guard only drops the prefix bonus — a genuine cross-file
+    duplicate (high similarity on Jaro alone) must still merge."""
+    nodes = [
+        {"id": "g1", "label": "GraphExtractor", "file_type": "concept", "source_file": "a.md"},
+        {"id": "g2", "label": "Graph Extractor", "file_type": "concept", "source_file": "b.md"},
+    ]
+    result_nodes, _ = deduplicate_entities(nodes, [], communities={})
+    assert len(result_nodes) == 1
