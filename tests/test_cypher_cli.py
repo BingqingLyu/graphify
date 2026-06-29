@@ -24,8 +24,8 @@ def _build_db(tmp_path) -> str:
     db_path = str(tmp_path / "graph.db")
     ext = json.loads(EXTRACTION_JSON.read_text())
     db, conn = init_db(db_path)
-    known = ensure_schema(conn)
-    ingest_extraction(conn, ext, incremental=False, known_tables=known)
+    ensure_schema(conn)
+    ingest_extraction(conn, ext, incremental=False)
     close_db(db, conn)
     return db_path
 
@@ -34,7 +34,7 @@ def test_cypher_command_basic(tmp_path):
     db_path = _build_db(tmp_path)
     result = subprocess.run(
         [sys.executable, "-m", "graphify", "cypher",
-         "MATCH (n:code) RETURN count(n)", "--db", db_path],
+         "MATCH (n:node {type: 'code'}) RETURN count(n)", "--db", db_path],
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0

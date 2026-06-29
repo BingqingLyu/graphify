@@ -3566,6 +3566,23 @@ def main() -> None:
         _backup(out)
         to_json(G, communities, str(out / "graph.json"), community_labels=labels)
         labels_path.write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding="utf-8")
+        try:
+            from graphify.storage import init_db as _init_db, ensure_schema as _ensure_schema, ingest_concepts as _ingest_concepts, close_db as _close_db
+            _db_path = str(out / "graph.db")
+            if Path(_db_path).exists():
+                _db, _conn = _init_db(_db_path)
+                _ensure_schema(_conn, create_tables=False)
+                _ingest_concepts(_conn, [
+                    {"id": f"concept_{cid}", "name": labels.get(cid, f"Community {cid}"),
+                     "source": "leiden", "members": members}
+                    for cid, members in communities.items()
+                ])
+                _close_db(_db, _conn)
+                print("[graphify cluster-only] graph.db concepts updated (powered by NeuG)")
+        except ImportError:
+            pass
+        except Exception as _exc:
+            print(f"[graphify cluster-only] warning: NeuG concept update failed: {_exc}", file=sys.stderr)
 
         # Mirror watch.py pattern: gate to_html so core outputs (graph.json +
         # GRAPH_REPORT.md) always land. Honor --no-viz explicitly; otherwise
@@ -4802,10 +4819,9 @@ def main() -> None:
                 _db_path = str(graphify_out / "graph.db")
                 _is_inc = Path(_db_path).exists()
                 _db, _conn = _init_db(_db_path)
-                _known = _ensure_schema(_conn, create_tables=not _is_inc)
+                _ensure_schema(_conn, create_tables=not _is_inc)
                 _ingest(_conn, merged, incremental=_is_inc,
-                        prune_sources=deleted_files or None, root=target,
-                        known_tables=_known)
+                        prune_sources=deleted_files or None, root=target)
                 _close_db(_db, _conn)
                 print("[graphify extract] graph.db written (powered by NeuG)")
             except ImportError:
@@ -4895,15 +4911,18 @@ def main() -> None:
         _to_json(G, communities, str(graph_json_path), force=True)
         stages.mark("export")
         try:
-            from graphify.storage import init_db as _init_db, ensure_schema as _ensure_schema, ingest_extraction as _ingest, ingest_communities as _ingest_comm, close_db as _close_db
+            from graphify.storage import init_db as _init_db, ensure_schema as _ensure_schema, ingest_extraction as _ingest, ingest_concepts as _ingest_concepts, close_db as _close_db
             _db_path = str(graphify_out / "graph.db")
             _is_inc = Path(_db_path).exists()
             _db, _conn = _init_db(_db_path)
-            _known = _ensure_schema(_conn, create_tables=not _is_inc)
-            _ntypes = _ingest(_conn, merged, incremental=_is_inc,
-                              prune_sources=deleted_files or None, root=target,
-                              known_tables=_known)
-            _ingest_comm(_conn, communities, node_types=_ntypes)
+            _ensure_schema(_conn, create_tables=not _is_inc)
+            _ingest(_conn, merged, incremental=_is_inc,
+                    prune_sources=deleted_files or None, root=target)
+            _ingest_concepts(_conn, [
+                {"id": f"concept_{cid}", "name": f"Community {cid}",
+                 "source": "leiden", "members": members}
+                for cid, members in communities.items()
+            ])
             _close_db(_db, _conn)
             print("[graphify extract] graph.db written (powered by NeuG)")
         except ImportError:
@@ -5096,6 +5115,75 @@ def main() -> None:
         out_path2.parent.mkdir(parents=True, exist_ok=True)
         out_path2.write_text(json.dumps(merged2, ensure_ascii=False), encoding="utf-8")
         print(f"Merged: {len(merged2['nodes'])} nodes, {len(merged2['edges'])} edges")
+
+    elif cmd == "concept-delta":
+        # graphify concept-delta --delta <path> [--mode temp|persistent] [--resolution N]
+        # Detect how incremental data affects existing concepts/communities.
+        delta_path: Path | None = None
+        delta_mode = "temp"
+        delta_resolution = 1.0
+        delta_out_format = "text"
+        _delta_watch: Path | None = None
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--delta" and i + 1 < len(sys.argv):
+                delta_path = Path(sys.argv[i + 1]); i += 2
+            elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
+                delta_mode = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--resolution" and i + 1 < len(sys.argv):
+                delta_resolution = float(sys.argv[i + 1]); i += 2
+            elif sys.argv[i] == "--format" and i + 1 < len(sys.argv):
+                delta_out_format = sys.argv[i + 1]; i += 2
+            elif sys.argv[i].startswith("--resolution="):
+                delta_resolution = float(sys.argv[i].split("=", 1)[1]); i += 1
+            elif sys.argv[i].startswith("--format="):
+                delta_out_format = sys.argv[i].split("=", 1)[1]; i += 1
+            elif not sys.argv[i].startswith("--"):
+                _delta_watch = Path(sys.argv[i]); i += 1
+            else:
+                i += 1
+        if delta_path is None:
+            print("Usage: graphify concept-delta --delta <path> [--mode temp|persistent] [--resolution N]", file=sys.stderr)
+            sys.exit(1)
+        if not delta_path.exists():
+            print(f"error: delta file not found: {delta_path}", file=sys.stderr)
+            sys.exit(1)
+        if _delta_watch is None:
+            _delta_watch = Path(".")
+        try:
+            from graphify.storage import init_db, ensure_schema, detect_concept_delta, close_db
+        except ImportError:
+            print("error: neug is not installed. Run: pip install neug", file=sys.stderr)
+            sys.exit(1)
+        _graphify_out = _delta_watch / _GRAPHIFY_OUT
+        _db_path = str(_graphify_out / "graph.db")
+        if not Path(_db_path).exists():
+            print(f"error: no graph.db found at {_db_path} — run `graphify extract` first", file=sys.stderr)
+            sys.exit(1)
+        _delta_data = json.loads(delta_path.read_text(encoding="utf-8"))
+        _db, _conn = init_db(_db_path)
+        ensure_schema(_conn, create_tables=False)
+        try:
+            _result = detect_concept_delta(_conn, _delta_data, resolution=delta_resolution, mode=delta_mode)
+        finally:
+            close_db(_db, _conn)
+        if delta_out_format == "json":
+            _serializable = {
+                "changes": _result["changes"],
+                "summary": _result["summary"],
+            }
+            print(json.dumps(_serializable, indent=2, default=str))
+        else:
+            _sum = _result["summary"]
+            print(f"Concept delta ({delta_mode} mode):")
+            print(f"  stable: {_sum.get('stable', 0)}")
+            print(f"  growth: {_sum.get('growth', 0)}")
+            print(f"  merge:  {_sum.get('merge', 0)}")
+            print(f"  split:  {_sum.get('split', 0)}")
+            print(f"  new:    {_sum.get('new', 0)}")
+            for _cid, _info in _result["changes"].items():
+                if _info["type"] != "stable":
+                    print(f"  [{_info['type']}] {_cid}")
 
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
         # User ran `graphify <path>` directly — treat as `graphify extract <path>`.
