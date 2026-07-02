@@ -2269,15 +2269,11 @@ def main() -> None:
         print("    --batch-size=N          communities per labeling LLM call (default 100)")
         print("  cypher \"MATCH ...\"       execute a Cypher query against graph.db (requires neug)")
         print("    --db <path>             path to graph.db (default graphify-out/graph.db)")
-        print("  concept-delta --delta P  detect how incremental data affects existing concepts")
-        print("    --mode temp|persistent  temp = analyze without modifying (default)")
-        print("    --resolution N          Leiden resolution (default 1.0)")
-        print("    --format text|json      output format")
         print("  import-wiki <path>       import wiki concepts into graph.db")
         print("    --format auto|graph-json|okf  input format (default: auto-detect)")
         print("    --db <path>             path to graph.db")
         print("  wiki-impact --delta P    analyze how raw changes affect wiki knowledge")
-        print("    --resolution N          Leiden resolution (default 1.0)")
+        print("    --mode persistent|temp  persistent = ingest into graph.db (default)")
         print("    --format text|json      output format")
         print("    --backend B             LLM backend for naming new concepts (optional)")
         print("    --model M               override backend model")
@@ -5176,75 +5172,6 @@ def main() -> None:
         out_path2.write_text(json.dumps(merged2, ensure_ascii=False), encoding="utf-8")
         print(f"Merged: {len(merged2['nodes'])} nodes, {len(merged2['edges'])} edges")
 
-    elif cmd == "concept-delta":
-        # graphify concept-delta --delta <path> [--mode temp|persistent] [--resolution N]
-        # Detect how incremental data affects existing concepts/communities.
-        delta_path: Path | None = None
-        delta_mode = "temp"
-        delta_resolution = 1.0
-        delta_out_format = "text"
-        _delta_watch: Path | None = None
-        i = 2
-        while i < len(sys.argv):
-            if sys.argv[i] == "--delta" and i + 1 < len(sys.argv):
-                delta_path = Path(sys.argv[i + 1]); i += 2
-            elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
-                delta_mode = sys.argv[i + 1]; i += 2
-            elif sys.argv[i] == "--resolution" and i + 1 < len(sys.argv):
-                delta_resolution = float(sys.argv[i + 1]); i += 2
-            elif sys.argv[i] == "--format" and i + 1 < len(sys.argv):
-                delta_out_format = sys.argv[i + 1]; i += 2
-            elif sys.argv[i].startswith("--resolution="):
-                delta_resolution = float(sys.argv[i].split("=", 1)[1]); i += 1
-            elif sys.argv[i].startswith("--format="):
-                delta_out_format = sys.argv[i].split("=", 1)[1]; i += 1
-            elif not sys.argv[i].startswith("--"):
-                _delta_watch = Path(sys.argv[i]); i += 1
-            else:
-                i += 1
-        if delta_path is None:
-            print("Usage: graphify concept-delta --delta <path> [--mode temp|persistent] [--resolution N]", file=sys.stderr)
-            sys.exit(1)
-        if not delta_path.exists():
-            print(f"error: delta file not found: {delta_path}", file=sys.stderr)
-            sys.exit(1)
-        if _delta_watch is None:
-            _delta_watch = Path(".")
-        try:
-            from graphify.storage import init_db, ensure_schema, detect_concept_delta, close_db
-        except ImportError:
-            print("error: neug is not installed. Run: pip install neug", file=sys.stderr)
-            sys.exit(1)
-        _graphify_out = _delta_watch / _GRAPHIFY_OUT
-        _db_path = str(_graphify_out / "graph.db")
-        if not Path(_db_path).exists():
-            print(f"error: no graph.db found at {_db_path} — run `graphify extract` first", file=sys.stderr)
-            sys.exit(1)
-        _delta_data = json.loads(delta_path.read_text(encoding="utf-8"))
-        _db, _conn = init_db(_db_path)
-        ensure_schema(_conn, create_tables=False)
-        try:
-            _result = detect_concept_delta(_conn, _delta_data, resolution=delta_resolution, mode=delta_mode)
-        finally:
-            close_db(_db, _conn)
-        if delta_out_format == "json":
-            _serializable = {
-                "changes": _result["changes"],
-                "summary": _result["summary"],
-            }
-            print(json.dumps(_serializable, indent=2, default=str))
-        else:
-            _sum = _result["summary"]
-            print(f"Concept delta ({delta_mode} mode):")
-            print(f"  stable: {_sum.get('stable', 0)}")
-            print(f"  growth: {_sum.get('growth', 0)}")
-            print(f"  merge:  {_sum.get('merge', 0)}")
-            print(f"  split:  {_sum.get('split', 0)}")
-            print(f"  new:    {_sum.get('new', 0)}")
-            for _cid, _info in _result["changes"].items():
-                if _info["type"] != "stable":
-                    print(f"  [{_info['type']}] {_cid}")
-
     elif cmd == "import-wiki":
         # graphify import-wiki <path> [--format auto|graph-json|okf] [--db <path>]
         import_path: Path | None = None
@@ -5290,11 +5217,11 @@ def main() -> None:
         print(f"Imported {count} concepts from {import_path}")
 
     elif cmd == "wiki-impact":
-        # graphify wiki-impact --delta <path> [--resolution N]
+        # graphify wiki-impact --delta <path> [--mode persistent|temp]
         #                        [--format text|json] [--backend B] [--model M]
         # Analyze how incremental raw data affects wiki knowledge.
         wiki_delta_path: Path | None = None
-        wiki_resolution = 1.0
+        wiki_mode = "persistent"
         wiki_out_format = "text"
         wiki_backend: str | None = None
         wiki_model: str | None = None
@@ -5303,8 +5230,8 @@ def main() -> None:
         while i < len(sys.argv):
             if sys.argv[i] == "--delta" and i + 1 < len(sys.argv):
                 wiki_delta_path = Path(sys.argv[i + 1]); i += 2
-            elif sys.argv[i] == "--resolution" and i + 1 < len(sys.argv):
-                wiki_resolution = float(sys.argv[i + 1]); i += 2
+            elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
+                wiki_mode = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--format" and i + 1 < len(sys.argv):
                 wiki_out_format = sys.argv[i + 1]; i += 2
             elif sys.argv[i] == "--backend" and i + 1 < len(sys.argv):
@@ -5315,8 +5242,8 @@ def main() -> None:
                 wiki_model = sys.argv[i + 1]; i += 2
             elif sys.argv[i].startswith("--model="):
                 wiki_model = sys.argv[i].split("=", 1)[1]; i += 1
-            elif sys.argv[i].startswith("--resolution="):
-                wiki_resolution = float(sys.argv[i].split("=", 1)[1]); i += 1
+            elif sys.argv[i].startswith("--mode="):
+                wiki_mode = sys.argv[i].split("=", 1)[1]; i += 1
             elif sys.argv[i].startswith("--format="):
                 wiki_out_format = sys.argv[i].split("=", 1)[1]; i += 1
             elif not sys.argv[i].startswith("--"):
@@ -5324,7 +5251,7 @@ def main() -> None:
             else:
                 i += 1
         if wiki_delta_path is None:
-            print("Usage: graphify wiki-impact --delta <path> [--resolution N] [--format text|json] [--backend B] [--model M]", file=sys.stderr)
+            print("Usage: graphify wiki-impact --delta <path> [--mode persistent|temp] [--format text|json] [--backend B] [--model M]", file=sys.stderr)
             sys.exit(1)
         if not wiki_delta_path.exists():
             print(f"error: delta file not found: {wiki_delta_path}", file=sys.stderr)
@@ -5345,7 +5272,7 @@ def main() -> None:
         _db, _conn = init_db(_db_path)
         ensure_schema(_conn, create_tables=False)
         try:
-            _result = detect_wiki_impact(_conn, _delta_data, resolution=wiki_resolution)
+            _result = detect_wiki_impact(_conn, _delta_data, mode=wiki_mode)
         finally:
             close_db(_db, _conn)
 
@@ -5379,15 +5306,17 @@ def main() -> None:
                 "concept_changes": _result["concept_changes"],
                 "new_concept_candidates": _result["new_concept_candidates"],
                 "link_changes": _result["link_changes"],
+                "structural_context": _result.get("structural_context", {}),
                 "summary": _result["summary"],
             }
             print(json.dumps(_serializable, indent=2, default=str))
         else:
             _sum = _result["summary"]
-            print(f"Wiki impact ({wiki_delta_mode} mode):")
+            print(f"Wiki impact ({wiki_mode} mode):")
             print(f"  concept changes:")
             print(f"    stable:    {_sum.get('stable', 0)}")
             print(f"    growth:    {_sum.get('growth', 0)}")
+            print(f"    merge:     {_sum.get('merge', 0)}")
             print(f"    split:     {_sum.get('split', 0)}")
             print(f"    dissolved: {_sum.get('dissolved', 0)}")
             print(f"  new concepts:  {_sum.get('new', 0)}")
