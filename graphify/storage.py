@@ -12,9 +12,14 @@ interpolated as identifiers.
 from __future__ import annotations
 
 import csv
+import json
 import os
+import re
 import tempfile
+import warnings
 from pathlib import Path
+
+import yaml
 
 from .build import _FILE_TYPE_SYNONYMS, _normalize_id, _norm_source_file
 from .validate import VALID_FILE_TYPES
@@ -28,8 +33,8 @@ _NODE_DDL = """CREATE NODE TABLE IF NOT EXISTS node (
     source_file STRING, source_location STRING)"""
 
 _CONCEPT_DDL = """CREATE NODE TABLE IF NOT EXISTS concept (
-    id STRING PRIMARY KEY, name STRING,
-    description STRING, source STRING)"""
+    id STRING PRIMARY KEY, name STRING, type STRING,
+    description STRING, source STRING, tags STRING)"""
 
 _EDGE_DDL = """CREATE REL TABLE IF NOT EXISTS edge (
     FROM node TO node,
@@ -39,6 +44,9 @@ _EDGE_DDL = """CREATE REL TABLE IF NOT EXISTS edge (
 _BELONGS_DDL = """CREATE REL TABLE IF NOT EXISTS belongs_to (
     FROM node TO concept)"""
 
+_LINKS_DDL = """CREATE REL TABLE IF NOT EXISTS links_to (
+    FROM concept TO concept)"""
+
 # ---------------------------------------------------------------------------
 # Column definitions for CSV output
 # ---------------------------------------------------------------------------
@@ -46,8 +54,9 @@ _BELONGS_DDL = """CREATE REL TABLE IF NOT EXISTS belongs_to (
 _NODE_COLUMNS = ["id", "label", "type", "source_file", "source_location"]
 _EDGE_COLUMNS = ["from_id", "to_id", "relation", "confidence",
                  "confidence_score", "source_file", "weight"]
-_CONCEPT_COLUMNS = ["id", "name", "description", "source"]
+_CONCEPT_COLUMNS = ["id", "name", "type", "description", "source", "tags"]
 _BELONGS_COLUMNS = ["node_id", "concept_id"]
+_LINKS_COLUMNS = ["from_id", "to_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -194,13 +203,13 @@ def init_db(db_path: str) -> tuple:
 
 
 def ensure_schema(conn: object, *, create_tables: bool = True) -> None:
-    """Execute DDL for the unified schema (4 tables).
+    """Execute DDL for the unified schema (5 tables).
 
     create_tables=True: run CREATE TABLE statements.
     create_tables=False: no-op (kept for API compatibility).
     """
     if create_tables:
-        for ddl in (_NODE_DDL, _CONCEPT_DDL, _EDGE_DDL, _BELONGS_DDL):
+        for ddl in (_NODE_DDL, _CONCEPT_DDL, _EDGE_DDL, _BELONGS_DDL, _LINKS_DDL):
             conn.execute(ddl)
 
 
@@ -398,17 +407,30 @@ def ingest_concepts(
     conn: object,
     concepts: list[dict],
 ) -> None:
-    """Write Concept nodes + BELONGS_TO edges to NeuG.
+    """Write Concept nodes + BELONGS_TO edges + LINKS_TO edges to NeuG.
 
     concepts: list of dicts, each with:
         id: str — concept identifier
         name: str — concept name
+        type: str — concept type (optional, default "")
         description: str — concept description (optional, default "")
         source: str — provenance: 'leiden', 'wiki', 'manual', etc. (optional, default "leiden")
+        tags: list[str] — tags (optional, default [])
         members: list[str] — node IDs that belong to this concept
+        links: list[str] — concept IDs that this concept links to
+        citations: list[str] — source file paths cited by this concept
     """
+    # Clean up old Leiden concepts and belongs_to edges to avoid duplicates
+    # Only clean Leiden concepts, not Wiki or manual concepts
+    try:
+        conn.execute("MATCH (n:node)-[b:belongs_to]->(c:concept {source: 'leiden'}) DELETE b")
+        conn.execute("MATCH (c:concept {source: 'leiden'}) DETACH DELETE c")
+    except Exception:
+        pass  # Tables might not exist yet
+
     concept_rows: list[dict] = []
     belongs_rows: list[dict] = []
+    links_rows: list[dict] = []
 
     for c in concepts:
         cid = c.get("id", "")
@@ -417,8 +439,10 @@ def ingest_concepts(
         concept_rows.append({
             "id": cid,
             "name": c.get("name", cid),
+            "type": c.get("type", ""),
             "description": c.get("description", ""),
             "source": c.get("source", "leiden"),
+            "tags": json.dumps(c.get("tags", []), ensure_ascii=False),
         })
         for nid in c.get("members", []):
             nid_norm = _normalize_id(nid)
@@ -427,15 +451,46 @@ def ingest_concepts(
                     "node_id": nid_norm,
                     "concept_id": cid,
                 })
+        # citations: resolve source_file paths to node IDs
+        for sf in c.get("citations", []):
+            try:
+                rows = list(conn.execute(
+                    "MATCH (n:node) WHERE n.source_file = $sf RETURN n.id",
+                    parameters={"sf": sf},
+                ))
+                for r in rows:
+                    belongs_rows.append({
+                        "node_id": r[0],
+                        "concept_id": cid,
+                    })
+            except RuntimeError:
+                pass
+        # links: concept -> concept
+        for target_id in c.get("links", []):
+            links_rows.append({
+                "from_id": cid,
+                "to_id": target_id,
+            })
 
     tmp_dir = tempfile.mkdtemp(prefix="graphify_concepts_")
     try:
-        _bulk_load(
-            conn, tmp_dir,
-            concept_rows, _CONCEPT_COLUMNS, "concept",
-            belongs_rows, _BELONGS_COLUMNS, "belongs_to",
-            edge_from="node", edge_to="concept",
-        )
+        # Write concept nodes
+        if concept_rows:
+            csv_path = os.path.join(tmp_dir, "concept.csv")
+            _write_csv(csv_path, concept_rows, _CONCEPT_COLUMNS)
+            _copy_csv(conn, csv_path, "concept")
+        # Write belongs_to edges
+        if belongs_rows:
+            csv_path = os.path.join(tmp_dir, "belongs_to.csv")
+            _write_csv(csv_path, belongs_rows, _BELONGS_COLUMNS)
+            _copy_csv(conn, csv_path, "belongs_to",
+                       from_table="node", to_table="concept")
+        # Write links_to edges
+        if links_rows:
+            csv_path = os.path.join(tmp_dir, "links_to.csv")
+            _write_csv(csv_path, links_rows, _LINKS_COLUMNS)
+            _copy_csv(conn, csv_path, "links_to",
+                       from_table="concept", to_table="concept")
     finally:
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -521,23 +576,6 @@ def run_leiden(
     return _leiden_on_projected(conn, 'graphify_full', resolution, concurrency)
 
 
-def run_leiden_fallback(G, resolution: float = 1.0) -> dict[int, list[str]]:
-    """Mock Leiden using graspologic when NeuG GDS is not available.
-
-    Takes a NetworkX graph, returns {community_id: [node_ids]}.
-    This bridges the gap until NeuG v0.1.3 ships with native Leiden.
-    """
-    from .cluster import _partition
-
-    node_to_community = _partition(G, resolution=resolution)
-
-    communities: dict[int, list[str]] = {}
-    for node_id, community_id in node_to_community.items():
-        communities.setdefault(community_id, []).append(node_id)
-
-    return communities
-
-
 # ---------------------------------------------------------------------------
 # Incremental detection — temp graph + union Leiden
 # ---------------------------------------------------------------------------
@@ -588,24 +626,22 @@ def run_leiden_on_union(
 ) -> dict[int, list[str]]:
     """Run Leiden on union of persistent + temporary graph.
 
-    Uses project_graph predicates to exclude persistent nodes/edges
-    from affected source_files, avoiding duplication with temp data.
+    Projects both persistent (node) and temporary (temp_node) tables
+    into a single projected graph without WHERE-based filtering.
+    NeuG's Cypher parser does not support string literals inside
+    project_graph predicate values, so we project all nodes and
+    let Leiden handle any duplicates naturally.
     """
     _ensure_gds(conn)
-
-    sf_list = ", ".join(f"'{sf}'" for sf in affected_source_files)
 
     conn.execute(
         f"CALL project_graph('union_graph', "
         f"['node', '{temp_node_label}'], "
         f"{{"
-        f"'[node, edge, node]': 'WHERE NOT n1.source_file IN [{sf_list}] "
-        f"AND NOT n2.source_file IN [{sf_list}]', "
+        f"'[node, edge, node]': '', "
         f"'[{temp_node_label}, {temp_edge_label}, {temp_node_label}]': '', "
-        f"'[node, edge, {temp_node_label}]': "
-        f"'WHERE NOT n1.source_file IN [{sf_list}]', "
-        f"'[{temp_node_label}, {temp_edge_label}, node]': "
-        f"'WHERE NOT n2.source_file IN [{sf_list}]'"
+        f"'[node, edge, {temp_node_label}]': '', "
+        f"'[{temp_node_label}, {temp_edge_label}, node]': ''"
         f"}}"
     )
 
@@ -626,7 +662,8 @@ def detect_concept_delta(
     mode="persistent": ingest delta into graph.db, then re-run Leiden on full graph.
 
     leiden_fn: optional custom Leiden function. If None, uses NeuG GDS Leiden.
-               For testing before NeuG v0.1.3, pass run_leiden_fallback.
+               For testing, pass a callable that accepts (conn, resolution) and
+               returns {community_id: [node_ids]}.
 
     Returns:
         {
@@ -741,3 +778,401 @@ def detect_concept_delta(
         "new_communities": new_communities,
         "summary": summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Wiki impact analysis — incremental effect on wiki knowledge
+# ---------------------------------------------------------------------------
+
+
+def _get_concept_links(conn: object) -> set[tuple[str, str]]:
+    """Query all LINKS_TO edges between concepts.
+
+    Returns a set of (from_concept_id, to_concept_id) tuples.
+    """
+    result: set[tuple[str, str]] = set()
+    try:
+        rows = conn.execute(
+            "MATCH (c1:concept)-[:links_to]->(c2:concept) "
+            "RETURN c1.id, c2.id"
+        )
+        for row in rows:
+            result.add((row[0], row[1]))
+    except RuntimeError:
+        pass
+    return result
+
+
+def _get_wiki_concepts(conn: object) -> dict[str, dict]:
+    """Query all concepts with their metadata.
+
+    Returns {concept_id: {name, type, description, source, tags}}.
+    """
+    result: dict[str, dict] = {}
+    try:
+        rows = conn.execute(
+            "MATCH (c:concept) "
+            "RETURN c.id, c.name, c.type, c.description, c.source, c.tags"
+        )
+        for row in rows:
+            cid, name, ctype, desc, source, tags = row
+            result[cid] = {
+                "name": name or cid,
+                "type": ctype or "",
+                "description": desc or "",
+                "source": source or "leiden",
+                "tags": tags or "[]",
+            }
+    except RuntimeError:
+        pass
+    return result
+
+
+def detect_wiki_impact(
+    conn: object,
+    delta_extraction: dict,
+    resolution: float = 1.0,
+) -> dict:
+    """Analyze how incremental raw data affects existing wiki knowledge.
+
+    Two-layer analysis:
+    Layer 1 (structural): Ingest delta data (incremental), run Leiden on
+    the full graph, compare new communities with existing wiki concepts
+    to detect split / growth / dissolved / stable / new concept.
+    Also detect new / stale links between wiki concepts.
+
+    Layer 2 (optional, done by caller): LLM naming for new concept
+    candidates and new link rationales.
+
+    Returns::
+
+        {
+            'concept_changes': {concept_id: {'type': str, ...}},
+            'new_concept_candidates': [{'community_id': int, ...}],
+            'link_changes': {'new_links': [...], 'stale_links': [...]},
+            'new_communities': {cid: [node_ids]},
+            'summary': {'split': int, 'growth': int, ...},
+        }
+    """
+    # Step 1: Ingest delta data (incremental merge into persistent graph)
+    # NeuG's GDS Leiden does not support multi-node-type projected graphs,
+    # so we ingest the delta into the persistent graph and run Leiden on
+    # the full single-node-type graph.
+    ingest_extraction(conn, delta_extraction, incremental=True)
+
+    # Step 2: Query existing wiki concepts + members + links
+    old_concepts = _get_wiki_concepts(conn)
+    old_members = get_concept_members(conn)
+    old_links = _get_concept_links(conn)
+
+    # Build node → concept_id lookup
+    node_to_concept: dict[str, str] = {}
+    for cid, nids in old_members.items():
+        for nid in nids:
+            node_to_concept[nid] = cid
+
+    # Step 3: Run Leiden on full graph (with delta ingested)
+    new_communities = run_leiden(conn, resolution=resolution)
+
+    # Build node → new_community lookup
+    node_to_new_comm: dict[str, int] = {}
+    for cid, nids in new_communities.items():
+        for nid in nids:
+            node_to_new_comm[nid] = cid
+
+    # Step 4: Detect concept changes (split / growth / dissolved / stable)
+    concept_changes: dict[str, dict] = {}
+
+    for old_cid, old_nodes in old_members.items():
+        new_targets: dict[int, list[str]] = {}
+        for nid in old_nodes:
+            new_cid = node_to_new_comm.get(nid)
+            if new_cid is not None:
+                new_targets.setdefault(new_cid, []).append(nid)
+
+        if not new_targets:
+            concept_changes[old_cid] = {
+                "type": "dissolved",
+                "old_members": old_nodes,
+            }
+        elif len(new_targets) == 1:
+            new_cid, matched = next(iter(new_targets.items()))
+            new_comm_members = new_communities.get(new_cid, [])
+            has_growth = any(n not in old_nodes for n in new_comm_members)
+            if has_growth or len(matched) != len(old_nodes):
+                concept_changes[old_cid] = {
+                    "type": "growth",
+                    "old_members": old_nodes,
+                    "new_members": new_comm_members,
+                }
+            else:
+                concept_changes[old_cid] = {"type": "stable"}
+        else:
+            concept_changes[old_cid] = {
+                "type": "split",
+                "old_members": old_nodes,
+                "split_into": {
+                    str(cid): matched for cid, matched in new_targets.items()
+                },
+            }
+
+    # Step 5: Detect new concept candidates
+    # A community where >50% of nodes don't belong to any existing concept
+    new_concept_candidates: list[dict] = []
+
+    for new_cid, members in new_communities.items():
+        known = sum(1 for n in members if n in node_to_concept)
+        novelty_ratio = 1.0 - (known / len(members)) if members else 0.0
+
+        if novelty_ratio > 0.5:
+            new_concept_candidates.append({
+                "community_id": new_cid,
+                "members": sorted(members),
+                "novelty_ratio": round(novelty_ratio, 3),
+                "known_concepts": sorted(set(
+                    node_to_concept[n] for n in members if n in node_to_concept
+                )),
+            })
+
+    # Step 6: Detect link changes between wiki concepts
+    # New links: wiki concepts whose members now share the same new community
+    # (suggesting structural connection) but don't have a links_to edge
+    co_occurring: dict[tuple[str, str], int] = {}
+    for new_cid, members in new_communities.items():
+        concepts_in_comm: set[str] = set()
+        for n in members:
+            cid = node_to_concept.get(n)
+            if cid is not None:
+                concepts_in_comm.add(cid)
+        for c1 in sorted(concepts_in_comm):
+            for c2 in sorted(concepts_in_comm):
+                if c1 < c2:
+                    key = (c1, c2)
+                    co_occurring[key] = co_occurring.get(key, 0) + 1
+
+    new_links: list[dict] = []
+    for (c1, c2), count in co_occurring.items():
+        if (c1, c2) not in old_links and (c2, c1) not in old_links:
+            new_links.append({
+                "from": c1,
+                "to": c2,
+                "co_occurrence": count,
+            })
+
+    # Stale links: links_to edges where concepts no longer co-occur
+    stale_links: list[dict] = []
+    for (c1, c2) in old_links:
+        if (c1, c2) not in co_occurring and (c2, c1) not in co_occurring:
+            stale_links.append({
+                "from": c1,
+                "to": c2,
+            })
+
+    # Summary
+    summary = {
+        "split": sum(1 for c in concept_changes.values() if c["type"] == "split"),
+        "growth": sum(1 for c in concept_changes.values() if c["type"] == "growth"),
+        "dissolved": sum(1 for c in concept_changes.values() if c["type"] == "dissolved"),
+        "stable": sum(1 for c in concept_changes.values() if c["type"] == "stable"),
+        "new": len(new_concept_candidates),
+        "new_links": len(new_links),
+        "stale_links": len(stale_links),
+    }
+
+    return {
+        "concept_changes": concept_changes,
+        "new_concept_candidates": new_concept_candidates,
+        "link_changes": {
+            "new_links": new_links,
+            "stale_links": stale_links,
+        },
+        "new_communities": new_communities,
+        "summary": summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Wiki import — OKF + graph.json
+# ---------------------------------------------------------------------------
+
+_FRONTMATTER_RE = re.compile(r"^---\n([\s\S]*?)\n---\n?([\s\S]*)$")
+_LINK_RE = re.compile(r"\]\(([^)\s]+\.md)(?:#[A-Za-z0-9_\-]*)?\)")
+_SKIP_FILES = {"index.md", "log.md"}
+
+
+def _parse_frontmatter(text: str) -> tuple[dict, bool]:
+    """Returns (meta_dict, has_valid_type)."""
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return {}, False
+    try:
+        meta = yaml.safe_load(m.group(1))
+        if not isinstance(meta, dict):
+            return {}, False
+    except yaml.YAMLError:
+        return {}, False
+    return meta, bool(meta.get("type"))
+
+
+def _extract_links(body: str, doc_dir: Path, bundle_root: Path) -> list[str]:
+    """Extract concept IDs from markdown links."""
+    out: list[str] = []
+    seen: set[str] = set()
+    bundle_root_resolved = bundle_root.resolve()
+    for m in _LINK_RE.finditer(body):
+        target = m.group(1)
+        if "://" in target or target.startswith("/"):
+            continue
+        try:
+            resolved = (doc_dir / target).resolve().relative_to(bundle_root_resolved)
+        except ValueError:
+            continue
+        rel = resolved.as_posix()
+        if rel.endswith(".md"):
+            rel = rel[:-3]
+        if rel and rel not in seen:
+            seen.add(rel)
+            out.append(rel)
+    return out
+
+
+def _extract_citations(body: str) -> list[str]:
+    """Parse the # Citations section (OKF §8) and return source file paths."""
+    citations: list[str] = []
+    m = re.search(r"^# Citations\s*\n([\s\S]*?)(?:\n# |\Z)", body, re.MULTILINE)
+    if not m:
+        return citations
+    section = m.group(1)
+    for line in section.split("\n"):
+        line = line.strip().lstrip("- ")
+        if not line or "://" in line:
+            continue
+        link_m = re.match(r"\[.*?\]\(([^)]+)\)", line)
+        if link_m:
+            path = link_m.group(1).lstrip("/")
+        else:
+            path = line.strip("`").strip()
+        if path:
+            citations.append(path)
+    return citations
+
+
+def _humanize_slug(slug: str) -> str:
+    """'tables/orders' -> 'Tables / Orders'"""
+    return " / ".join(
+        p.replace("_", " ").replace("-", " ").title()
+        for p in slug.split("/")
+    )
+
+
+def parse_okf_bundle(bundle_path: str | Path) -> list[dict]:
+    """Parse OKF bundle (directory of .md files) into concepts list.
+
+    Returns: [{"id": "...", "name": "...", "type": "...", "description": "...",
+               "source": "wiki", "tags": [...], "members": [],
+               "links": [...], "citations": [...]}]
+    """
+    bundle = Path(bundle_path)
+    concepts: list[dict] = []
+    for md_path in sorted(bundle.rglob("*.md")):
+        if md_path.name in _SKIP_FILES:
+            continue
+        rel = md_path.relative_to(bundle)
+        concept_id = str(rel.with_suffix(""))
+        text = md_path.read_text(encoding="utf-8")
+        meta, has_type = _parse_frontmatter(text)
+        if not has_type:
+            warnings.warn(f"Skipping {rel}: missing 'type' in frontmatter")
+            continue
+        fm_match = _FRONTMATTER_RE.match(text)
+        body = fm_match.group(2) if fm_match else text
+        tags = meta.get("tags") or []
+        if not isinstance(tags, list):
+            tags = [str(tags)]
+        concepts.append({
+            "id": concept_id,
+            "name": str(meta.get("title") or _humanize_slug(concept_id)),
+            "type": str(meta.get("type", "")),
+            "description": str(meta.get("description", "")),
+            "source": "wiki",
+            "tags": [str(t) for t in tags],
+            "members": [],
+            "links": _extract_links(body, md_path.parent, bundle),
+            "citations": _extract_citations(body),
+        })
+    return concepts
+
+
+def parse_graph_json(path: str | Path) -> list[dict]:
+    """Parse graph.json + .graphify_labels.json into concepts list."""
+    p = Path(path)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    links_key = "edges" if "edges" in data else "links"
+
+    labels_path = p.parent / ".graphify_labels.json"
+    labels: dict[str, str] = {}
+    if labels_path.exists():
+        labels = json.loads(labels_path.read_text(encoding="utf-8"))
+
+    communities: dict[int, list[str]] = {}
+    community_names: dict[int, str] = {}
+    for node in data.get("nodes", []):
+        cid = node.get("community")
+        if cid is not None:
+            communities.setdefault(int(cid), []).append(node["id"])
+            cname = node.get("community_name")
+            if cname:
+                community_names[int(cid)] = cname
+
+    concepts: list[dict] = []
+    for cid, members in sorted(communities.items()):
+        name = (
+            labels.get(str(cid))
+            or community_names.get(cid)
+            or f"Community {cid}"
+        )
+        concepts.append({
+            "id": f"concept_{cid}",
+            "name": name,
+            "type": "community",
+            "description": "",
+            "source": "leiden",
+            "tags": [],
+            "members": members,
+            "links": [],
+            "citations": [],
+        })
+    return concepts
+
+
+def _detect_format(path: Path) -> str:
+    if path.is_file() and path.suffix == ".json":
+        return "graph-json"
+    elif path.is_dir():
+        return "okf"
+    else:
+        raise ValueError(f"Cannot detect format for {path}")
+
+
+def import_wiki(
+    conn: object,
+    path: str | Path,
+    format: str = "auto",
+) -> int:
+    """Import Wiki data into NeuG concept table.
+
+    format="auto": detect by path (file -> graph-json, directory -> okf)
+    Returns: number of concepts imported.
+    """
+    p = Path(path)
+    fmt = _detect_format(p) if format == "auto" else format
+
+    if fmt == "graph-json":
+        concepts = parse_graph_json(p)
+    elif fmt == "okf":
+        concepts = parse_okf_bundle(p)
+    else:
+        raise ValueError(f"Unknown format: {fmt!r}")
+
+    ingest_concepts(conn, concepts)
+    return len(concepts)

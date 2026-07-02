@@ -2269,6 +2269,18 @@ def main() -> None:
         print("    --batch-size=N          communities per labeling LLM call (default 100)")
         print("  cypher \"MATCH ...\"       execute a Cypher query against graph.db (requires neug)")
         print("    --db <path>             path to graph.db (default graphify-out/graph.db)")
+        print("  concept-delta --delta P  detect how incremental data affects existing concepts")
+        print("    --mode temp|persistent  temp = analyze without modifying (default)")
+        print("    --resolution N          Leiden resolution (default 1.0)")
+        print("    --format text|json      output format")
+        print("  import-wiki <path>       import wiki concepts into graph.db")
+        print("    --format auto|graph-json|okf  input format (default: auto-detect)")
+        print("    --db <path>             path to graph.db")
+        print("  wiki-impact --delta P    analyze how raw changes affect wiki knowledge")
+        print("    --resolution N          Leiden resolution (default 1.0)")
+        print("    --format text|json      output format")
+        print("    --backend B             LLM backend for naming new concepts (optional)")
+        print("    --model M               override backend model")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
         print("    --dfs                   use depth-first instead of breadth-first")
         print("    --context C             explicit edge-context filter (repeatable)")
@@ -3442,6 +3454,7 @@ def main() -> None:
                 i_arg += 1
         if watch_path is None:
             watch_path = Path(".")
+
         graph_json = graph_override if graph_override is not None else watch_path / _GRAPHIFY_OUT / "graph.json"
         if not graph_json.exists():
             print(
@@ -3459,6 +3472,7 @@ def main() -> None:
         )
         from graphify.report import generate
         from graphify.export import to_json, to_html
+        import networkx as nx
 
         stages = _StageTimer(co_timing)
         print("Loading existing graph...")
@@ -3486,13 +3500,39 @@ def main() -> None:
         G = build_from_json(_raw, directed=_directed)
         print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
         stages.mark("load")
+
+        # Try NeuG Leiden (graph.db already has data from extract).
+        # Fall back to Python cluster() if NeuG not available.
+        _neug_conn = None
+        _neug_db = None
+        try:
+            from graphify.storage import init_db as _init_db, run_leiden as _run_leiden, close_db as _close_db
+            from graphify.cluster import postprocess_communities
+            _db_path = watch_path / _GRAPHIFY_OUT / "graph.db"
+            if _db_path.exists():
+                _neug_db, _neug_conn = _init_db(str(_db_path))
+        except (ImportError, Exception):
+            _neug_conn = None
+
         print("Re-clustering...")
-        communities = cluster(G, resolution=co_resolution, exclude_hubs_percentile=co_exclude_hubs)
+        if _neug_conn is not None:
+            try:
+                _raw_communities = _run_leiden(_neug_conn, resolution=co_resolution)
+                communities = postprocess_communities(G, _raw_communities)
+                print(f"NeuG Leiden: {len(communities)} communities")
+            except Exception as exc:
+                print(f"NeuG Leiden failed ({exc}), falling back to Python", file=sys.stderr)
+                communities = cluster(G, resolution=co_resolution,
+                                      exclude_hubs_percentile=co_exclude_hubs)
+            finally:
+                _close_db(_neug_db, _neug_conn)
+        else:
+            communities = cluster(G, resolution=co_resolution,
+                                  exclude_hubs_percentile=co_exclude_hubs)
+
         # Mirror the watch/update path (#822): map new cids to prior ones by
         # node-overlap so the existing .graphify_labels.json keeps attaching
-        # to the same conceptual community after re-clustering. Without this,
-        # labels follow raw cid index and become misaligned whenever the
-        # graph has changed between labeling and cluster-only (#1027).
+        # to the same conceptual community after re-clustering.
         previous_node_community = {
             n["id"]: n["community"]
             for n in _raw.get("nodes", [])
@@ -3501,6 +3541,7 @@ def main() -> None:
         if previous_node_community:
             communities = remap_communities_to_previous(communities, previous_node_community)
         stages.mark("cluster")
+
         cohesion = score_all(G, communities)
         gods = god_nodes(G)
         surprises = surprising_connections(G, communities)
@@ -4893,7 +4934,32 @@ def main() -> None:
             )
             sys.exit(1)
 
-        communities = _cluster(G, resolution=cli_resolution, exclude_hubs_percentile=cli_exclude_hubs)
+        # Ingest extraction data to NeuG (persist for wiki-impact).
+        # Keep conn open so clustering can use NeuG Leiden directly.
+        _neug_db = None
+        _neug_conn = None
+        try:
+            from graphify.storage import (
+                init_db as _init_db, ensure_schema as _ensure_schema,
+                ingest_extraction as _ingest, close_db as _close_db,
+            )
+            _db_path = str(graphify_out / "graph.db")
+            _is_inc = Path(_db_path).exists()
+            _neug_db, _neug_conn = _init_db(_db_path)
+            _ensure_schema(_neug_conn, create_tables=not _is_inc)
+            _ingest(_neug_conn, merged, incremental=_is_inc,
+                    prune_sources=deleted_files or None, root=target)
+        except ImportError:
+            _neug_db = None
+            _neug_conn = None
+        except Exception as _exc:
+            print(f"[graphify extract] warning: NeuG init failed: {_exc}", file=sys.stderr)
+            _neug_db = None
+            _neug_conn = None
+
+        # Cluster — NeuG Leiden if graph.db available, else Python graspologic/networkx.
+        communities = _cluster(G, conn=_neug_conn, resolution=cli_resolution,
+                               exclude_hubs_percentile=cli_exclude_hubs)
         stages.mark("cluster")
         cohesion = _score_all(G, communities)
         try:
@@ -4910,25 +4976,19 @@ def main() -> None:
         _backup(graphify_out)
         _to_json(G, communities, str(graph_json_path), force=True)
         stages.mark("export")
-        try:
-            from graphify.storage import init_db as _init_db, ensure_schema as _ensure_schema, ingest_extraction as _ingest, ingest_concepts as _ingest_concepts, close_db as _close_db
-            _db_path = str(graphify_out / "graph.db")
-            _is_inc = Path(_db_path).exists()
-            _db, _conn = _init_db(_db_path)
-            _ensure_schema(_conn, create_tables=not _is_inc)
-            _ingest(_conn, merged, incremental=_is_inc,
-                    prune_sources=deleted_files or None, root=target)
-            _ingest_concepts(_conn, [
-                {"id": f"concept_{cid}", "name": f"Community {cid}",
-                 "source": "leiden", "members": members}
-                for cid, members in communities.items()
-            ])
-            _close_db(_db, _conn)
+        # Write clustering results (concepts) to graph.db
+        if _neug_conn is not None:
+            try:
+                from graphify.storage import ingest_concepts as _ingest_concepts
+                _ingest_concepts(_neug_conn, [
+                    {"id": f"concept_{cid}", "name": f"Community {cid}",
+                     "source": "leiden", "members": members}
+                    for cid, members in communities.items()
+                ])
+            except Exception as _exc:
+                print(f"[graphify extract] warning: NeuG concept write failed: {_exc}", file=sys.stderr)
+            _close_db(_neug_db, _neug_conn)
             print("[graphify extract] graph.db written (powered by NeuG)")
-        except ImportError:
-            pass
-        except Exception as _exc:
-            print(f"[graphify extract] warning: NeuG write failed: {_exc}", file=sys.stderr)
         if merged.get("output_tokens", 0) > 0:
             (graphify_out / ".graphify_semantic_marker").write_text(
                 json.dumps({"output_tokens": merged["output_tokens"]}), encoding="utf-8"
@@ -5184,6 +5244,172 @@ def main() -> None:
             for _cid, _info in _result["changes"].items():
                 if _info["type"] != "stable":
                     print(f"  [{_info['type']}] {_cid}")
+
+    elif cmd == "import-wiki":
+        # graphify import-wiki <path> [--format auto|graph-json|okf] [--db <path>]
+        import_path: Path | None = None
+        import_format = "auto"
+        import_db: Path | None = None
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--format" and i + 1 < len(sys.argv):
+                import_format = sys.argv[i + 1]; i += 2
+            elif sys.argv[i].startswith("--format="):
+                import_format = sys.argv[i].split("=", 1)[1]; i += 1
+            elif sys.argv[i] == "--db" and i + 1 < len(sys.argv):
+                import_db = Path(sys.argv[i + 1]); i += 2
+            elif sys.argv[i].startswith("--db="):
+                import_db = Path(sys.argv[i].split("=", 1)[1]); i += 1
+            elif not sys.argv[i].startswith("--"):
+                import_path = Path(sys.argv[i]); i += 1
+            else:
+                i += 1
+        if import_path is None:
+            print("Usage: graphify import-wiki <path> [--format auto|graph-json|okf] [--db <path>]", file=sys.stderr)
+            sys.exit(1)
+        if not import_path.exists():
+            print(f"error: path not found: {import_path}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            from graphify.storage import init_db, ensure_schema, import_wiki, close_db
+        except ImportError:
+            print("error: neug is not installed. Run: pip install neug", file=sys.stderr)
+            sys.exit(1)
+        if import_db is None:
+            _graphify_out = Path(".") / _GRAPHIFY_OUT
+            import_db = _graphify_out / "graph.db"
+        if not import_db.exists():
+            print(f"error: no graph.db found at {import_db} — run `graphify extract` first or use --db", file=sys.stderr)
+            sys.exit(1)
+        _db, _conn = init_db(str(import_db))
+        ensure_schema(_conn, create_tables=False)
+        try:
+            count = import_wiki(_conn, import_path, format=import_format)
+        finally:
+            close_db(_db, _conn)
+        print(f"Imported {count} concepts from {import_path}")
+
+    elif cmd == "wiki-impact":
+        # graphify wiki-impact --delta <path> [--resolution N]
+        #                        [--format text|json] [--backend B] [--model M]
+        # Analyze how incremental raw data affects wiki knowledge.
+        wiki_delta_path: Path | None = None
+        wiki_resolution = 1.0
+        wiki_out_format = "text"
+        wiki_backend: str | None = None
+        wiki_model: str | None = None
+        _wiki_watch: Path | None = None
+        i = 2
+        while i < len(sys.argv):
+            if sys.argv[i] == "--delta" and i + 1 < len(sys.argv):
+                wiki_delta_path = Path(sys.argv[i + 1]); i += 2
+            elif sys.argv[i] == "--resolution" and i + 1 < len(sys.argv):
+                wiki_resolution = float(sys.argv[i + 1]); i += 2
+            elif sys.argv[i] == "--format" and i + 1 < len(sys.argv):
+                wiki_out_format = sys.argv[i + 1]; i += 2
+            elif sys.argv[i] == "--backend" and i + 1 < len(sys.argv):
+                wiki_backend = sys.argv[i + 1]; i += 2
+            elif sys.argv[i].startswith("--backend="):
+                wiki_backend = sys.argv[i].split("=", 1)[1]; i += 1
+            elif sys.argv[i] == "--model" and i + 1 < len(sys.argv):
+                wiki_model = sys.argv[i + 1]; i += 2
+            elif sys.argv[i].startswith("--model="):
+                wiki_model = sys.argv[i].split("=", 1)[1]; i += 1
+            elif sys.argv[i].startswith("--resolution="):
+                wiki_resolution = float(sys.argv[i].split("=", 1)[1]); i += 1
+            elif sys.argv[i].startswith("--format="):
+                wiki_out_format = sys.argv[i].split("=", 1)[1]; i += 1
+            elif not sys.argv[i].startswith("--"):
+                _wiki_watch = Path(sys.argv[i]); i += 1
+            else:
+                i += 1
+        if wiki_delta_path is None:
+            print("Usage: graphify wiki-impact --delta <path> [--resolution N] [--format text|json] [--backend B] [--model M]", file=sys.stderr)
+            sys.exit(1)
+        if not wiki_delta_path.exists():
+            print(f"error: delta file not found: {wiki_delta_path}", file=sys.stderr)
+            sys.exit(1)
+        if _wiki_watch is None:
+            _wiki_watch = Path(".")
+        try:
+            from graphify.storage import init_db, ensure_schema, detect_wiki_impact, close_db
+        except ImportError:
+            print("error: neug is not installed. Run: pip install neug", file=sys.stderr)
+            sys.exit(1)
+        _graphify_out = _wiki_watch / _GRAPHIFY_OUT
+        _db_path = str(_graphify_out / "graph.db")
+        if not Path(_db_path).exists():
+            print(f"error: no graph.db found at {_db_path} — run `graphify extract` first", file=sys.stderr)
+            sys.exit(1)
+        _delta_data = json.loads(wiki_delta_path.read_text(encoding="utf-8"))
+        _db, _conn = init_db(_db_path)
+        ensure_schema(_conn, create_tables=False)
+        try:
+            _result = detect_wiki_impact(_conn, _delta_data, resolution=wiki_resolution)
+        finally:
+            close_db(_db, _conn)
+
+        # Optional Layer 2: LLM naming for new concept candidates
+        if wiki_backend and _result["new_concept_candidates"]:
+            _graph_json = _graphify_out / "graph.json"
+            if _graph_json.exists():
+                try:
+                    from graphify.build import build_from_json as _build_from_json
+                    from graphify.llm import label_communities as _label_communities, detect_backend as _detect_backend_llm
+                    _raw_data = json.loads(_graph_json.read_text(encoding="utf-8"))
+                    _G_wiki = _build_from_json(_raw_data)
+                    _wiki_communities = {
+                        c["community_id"]: c["members"]
+                        for c in _result["new_concept_candidates"]
+                    }
+                    _actual_backend = wiki_backend or _detect_backend_llm() or "gemini"
+                    _labels = _label_communities(
+                        _G_wiki, _wiki_communities,
+                        backend=_actual_backend, model=wiki_model,
+                    )
+                    for c in _result["new_concept_candidates"]:
+                        c["name"] = _labels.get(c["community_id"], f"Community {c['community_id']}")
+                except Exception as _e:
+                    print(f"warning: LLM naming failed: {_e}", file=sys.stderr)
+            else:
+                print("warning: graph.json not found, skipping LLM naming", file=sys.stderr)
+
+        if wiki_out_format == "json":
+            _serializable = {
+                "concept_changes": _result["concept_changes"],
+                "new_concept_candidates": _result["new_concept_candidates"],
+                "link_changes": _result["link_changes"],
+                "summary": _result["summary"],
+            }
+            print(json.dumps(_serializable, indent=2, default=str))
+        else:
+            _sum = _result["summary"]
+            print(f"Wiki impact ({wiki_delta_mode} mode):")
+            print(f"  concept changes:")
+            print(f"    stable:    {_sum.get('stable', 0)}")
+            print(f"    growth:    {_sum.get('growth', 0)}")
+            print(f"    split:     {_sum.get('split', 0)}")
+            print(f"    dissolved: {_sum.get('dissolved', 0)}")
+            print(f"  new concepts:  {_sum.get('new', 0)}")
+            print(f"  new links:     {_sum.get('new_links', 0)}")
+            print(f"  stale links:   {_sum.get('stale_links', 0)}")
+            for _cid, _info in _result["concept_changes"].items():
+                if _info["type"] != "stable":
+                    print(f"  [{_info['type']}] {_cid}")
+            if _result["new_concept_candidates"]:
+                print("  --- new concept candidates ---")
+                for c in _result["new_concept_candidates"]:
+                    _name = c.get("name", f"Community {c['community_id']}")
+                    print(f"    {_name} (novelty: {c['novelty_ratio']}, members: {len(c['members'])})")
+            _lc = _result["link_changes"]
+            if _lc["new_links"]:
+                print("  --- new links ---")
+                for _link in _lc["new_links"]:
+                    print(f"    {_link['from']} -> {_link['to']} (co-occurrence: {_link['co_occurrence']})")
+            if _lc["stale_links"]:
+                print("  --- stale links ---")
+                for _link in _lc["stale_links"]:
+                    print(f"    {_link['from']} -> {_link['to']}")
 
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
         # User ran `graphify <path>` directly — treat as `graphify extract <path>`.

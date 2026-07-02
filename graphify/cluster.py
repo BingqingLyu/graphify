@@ -83,8 +83,91 @@ _COHESION_SPLIT_THRESHOLD = 0.05 # re-split communities with cohesion below this
 _COHESION_SPLIT_MIN_SIZE = 50    # only cohesion-split if community has at least this many nodes
 
 
+def _extract_and_reattach_hubs(
+    G: nx.Graph,
+    raw: dict[int, list[str]],
+    hub_nodes: set[str],
+) -> None:
+    """Remove hub nodes from raw communities (in-place) and reattach by majority vote.
+
+    Used after NeuG Leiden, which runs on the full graph including hubs.
+    The Python path excludes hubs before partitioning instead, so it doesn't
+    need this step.
+    """
+    # Remove hubs from all communities
+    for cid in list(raw.keys()):
+        raw[cid] = [n for n in raw[cid] if n not in hub_nodes]
+        if not raw[cid]:
+            del raw[cid]
+
+    # Build node -> community lookup for non-hub nodes
+    node_community: dict[str, int] = {n: cid for cid, nodes in raw.items() for n in nodes}
+    next_cid = max(raw.keys(), default=-1) + 1
+
+    # Reattach each hub by majority-vote neighbour community
+    for hub in sorted(hub_nodes):
+        votes: dict[int, int] = {}
+        for nb in G.neighbors(hub):
+            cid = node_community.get(nb)
+            if cid is not None:
+                votes[cid] = votes.get(cid, 0) + 1
+        if votes:
+            best = min(votes, key=lambda c: (-votes[c], c))
+            raw.setdefault(best, []).append(hub)
+            node_community[hub] = best
+        else:
+            raw[next_cid] = [hub]
+            node_community[hub] = next_cid
+            next_cid += 1
+
+
+def postprocess_communities(
+    G: nx.Graph,
+    raw: dict[int, list[str]],
+) -> dict[int, list[str]]:
+    """Apply post-processing to raw communities from any source.
+
+    Steps:
+    1. Split oversized communities (> 25% of graph nodes, min 10)
+    2. Re-split low-cohesion communities caused by doc-hub nodes
+    3. Re-index by size descending (deterministic, stable across runs)
+
+    Works with raw communities from either Python (graspologic/networkx)
+    or NeuG native Leiden.
+    """
+    # Split oversized communities
+    max_size = max(_MIN_SPLIT_SIZE, int(G.number_of_nodes() * _MAX_COMMUNITY_FRACTION))
+    final_communities: list[list[str]] = []
+    for nodes in raw.values():
+        if len(nodes) > max_size:
+            final_communities.extend(_split_community(G, nodes))
+        else:
+            final_communities.append(nodes)
+
+    # Second pass: re-split low-cohesion communities caused by doc-hub nodes
+    # that bridge otherwise-unrelated subsystems (e.g. CLAUDE.md connected to everything).
+    second_pass: list[list[str]] = []
+    for nodes in final_communities:
+        if len(nodes) >= _COHESION_SPLIT_MIN_SIZE and cohesion_score(G, nodes) < _COHESION_SPLIT_THRESHOLD:
+            splits = _split_community(G, nodes)
+            second_pass.extend(splits if len(splits) > 1 else [nodes])
+        else:
+            second_pass.append(nodes)
+    final_communities = second_pass
+
+    # Re-index by size descending. The tuple(sorted(nodes)) tiebreak makes this a
+    # TOTAL order, so an identical grouping always gets identical community IDs.
+    # Without it, the hundreds of equal-sized small communities are ordered by the
+    # partitioner's (not seed-stable) enumeration order, so their integer IDs
+    # permute run-to-run - which reads as massive "community churn" in a per-node
+    # cid diff even though the actual grouping is reproducible (#1090 follow-up).
+    final_communities.sort(key=lambda nodes: (-len(nodes), tuple(sorted(map(str, nodes)))))
+    return {i: sorted(nodes) for i, nodes in enumerate(final_communities)}
+
+
 def cluster(
     G: nx.Graph,
+    conn: object | None = None,
     resolution: float = 1.0,
     exclude_hubs_percentile: float | None = None,
 ) -> dict[int, list[str]]:
@@ -97,6 +180,9 @@ def cluster(
     Accepts directed or undirected graphs. DiGraphs are converted to undirected
     internally since Louvain/Leiden require undirected input.
 
+    conn: optional NeuG connection. When provided, NeuG native Leiden (GDS)
+        is used instead of Python graspologic/networkx. Falls back to Python
+        on any error.
     resolution: passed to Leiden/Louvain. >1.0 = more smaller communities,
         <1.0 = fewer larger communities. Default 1.0.
     exclude_hubs_percentile: if set (0-100), nodes whose degree exceeds this
@@ -120,8 +206,23 @@ def cluster(
             threshold = degrees[idx]
             hub_nodes = {n for n, d in G.degree() if d > threshold}
 
-    # Leiden warns and drops isolates - handle them separately
-    # Also exclude hub nodes from partitioning so they don't pull unrelated
+    # --- NeuG Leiden path ---
+    if conn is not None:
+        try:
+            from .storage import run_leiden
+            neu_raw = run_leiden(conn, resolution=resolution)
+            if neu_raw:
+                # NeuG Leiden runs on the full graph (including hubs).
+                # Extract hubs from results and reattach by majority vote
+                # so they don't skew community boundaries.
+                if hub_nodes:
+                    _extract_and_reattach_hubs(G, neu_raw, hub_nodes)
+                return postprocess_communities(G, neu_raw)
+        except Exception:
+            pass  # Fall through to Python path
+
+    # --- Python path (graspologic / networkx Louvain) ---
+    # Exclude hub nodes from partitioning so they don't pull unrelated
     # subsystems into the same community
     excluded = hub_nodes
     isolates = [n for n in G.nodes() if G.degree(n) == 0 and n not in excluded]
@@ -158,34 +259,7 @@ def cluster(
                 node_community[hub] = next_cid
                 next_cid += 1
 
-    # Split oversized communities
-    max_size = max(_MIN_SPLIT_SIZE, int(G.number_of_nodes() * _MAX_COMMUNITY_FRACTION))
-    final_communities: list[list[str]] = []
-    for nodes in raw.values():
-        if len(nodes) > max_size:
-            final_communities.extend(_split_community(G, nodes))
-        else:
-            final_communities.append(nodes)
-
-    # Second pass: re-split low-cohesion communities caused by doc-hub nodes
-    # that bridge otherwise-unrelated subsystems (e.g. CLAUDE.md connected to everything).
-    second_pass: list[list[str]] = []
-    for nodes in final_communities:
-        if len(nodes) >= _COHESION_SPLIT_MIN_SIZE and cohesion_score(G, nodes) < _COHESION_SPLIT_THRESHOLD:
-            splits = _split_community(G, nodes)
-            second_pass.extend(splits if len(splits) > 1 else [nodes])
-        else:
-            second_pass.append(nodes)
-    final_communities = second_pass
-
-    # Re-index by size descending. The tuple(sorted(nodes)) tiebreak makes this a
-    # TOTAL order, so an identical grouping always gets identical community IDs.
-    # Without it, the hundreds of equal-sized small communities are ordered by the
-    # partitioner's (not seed-stable) enumeration order, so their integer IDs
-    # permute run-to-run - which reads as massive "community churn" in a per-node
-    # cid diff even though the actual grouping is reproducible (#1090 follow-up).
-    final_communities.sort(key=lambda nodes: (-len(nodes), tuple(sorted(map(str, nodes)))))
-    return {i: sorted(nodes) for i, nodes in enumerate(final_communities)}
+    return postprocess_communities(G, raw)
 
 
 def _split_community(G: nx.Graph, nodes: list[str]) -> list[list[str]]:

@@ -3,7 +3,14 @@ import sys
 import networkx as nx
 from pathlib import Path
 from graphify.build import build_from_json
-from graphify.cluster import cluster, cohesion_score, remap_communities_to_previous, score_all
+from graphify.cluster import (
+    cluster,
+    cohesion_score,
+    postprocess_communities,
+    _extract_and_reattach_hubs,
+    remap_communities_to_previous,
+    score_all,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -98,3 +105,123 @@ def test_remap_communities_to_previous_assigns_deterministic_new_ids():
     assert list(remapped.keys()) == [0, 1]
     assert remapped[0] == ["x", "y", "z"]
     assert remapped[1] == ["m"]
+
+
+# --- postprocess_communities ---
+
+def test_postprocess_communities_reindexes_by_size_desc():
+    """Largest community should get ID 0 after postprocessing."""
+    G = nx.Graph()
+    # Add edges within each group so they survive the oversized-split check
+    for i in range(15):
+        for j in range(i + 1, 15):
+            G.add_edge(f"n{i}", f"n{j}")
+    for i in range(15, 20):
+        for j in range(i + 1, 20):
+            G.add_edge(f"n{i}", f"n{j}")
+    raw = {
+        100: [f"n{i}" for i in range(15)],  # largest
+        200: [f"n{i}" for i in range(15, 20)],  # smaller
+    }
+    result = postprocess_communities(G, raw)
+    # ID 0 = largest, ID 1 = smaller
+    assert len(result[0]) == 15
+    assert len(result[1]) == 5
+
+
+def test_postprocess_communities_splits_oversized():
+    """Community >25% of graph nodes should be split."""
+    G = nx.Graph()
+    # Create a graph with two dense clusters connected by a bridge
+    for i in range(20):
+        for j in range(i + 1, 20):
+            G.add_edge(f"a{i}", f"a{j}")
+    for i in range(20):
+        for j in range(i + 1, 20):
+            G.add_edge(f"b{i}", f"b{j}")
+    G.add_edge("a0", "b0")  # bridge
+
+    raw = {0: [f"a{i}" for i in range(20)] + [f"b{i}" for i in range(20)]}
+    result = postprocess_communities(G, raw)
+    # The oversized community should be split into at least 2
+    assert len(result) >= 2
+
+
+def test_postprocess_communities_empty():
+    """Empty input should return empty dict."""
+    G = nx.Graph()
+    assert postprocess_communities(G, {}) == {}
+
+
+# --- _extract_and_reattach_hubs ---
+
+def test_extract_and_reattach_hubs_majority_vote():
+    """Hub nodes should be reattached to their majority-vote neighbour community."""
+    G = nx.Graph()
+    # Community A: 4 nodes, Community B: 2 nodes, Hub connected to both
+    for i in range(4):
+        G.add_node(f"a{i}")
+    for i in range(2):
+        G.add_node(f"b{i}")
+    G.add_node("hub")
+    # Hub connects to 3 A-nodes and 1 B-node
+    G.add_edges_from([("hub", "a0"), ("hub", "a1"), ("hub", "a2"), ("hub", "b0")])
+
+    raw = {0: ["a0", "a1", "a2", "a3", "hub"], 1: ["b0", "b1"]}
+    _extract_and_reattach_hubs(G, raw, {"hub"})
+
+    # Hub should be in community 0 (3 A-neighbours vs 1 B-neighbour)
+    assert "hub" in raw[0]
+    assert "hub" not in raw.get(1, [])
+
+
+def test_extract_and_reattach_hubs_isolated_hub():
+    """Hub with no neighbours in any community gets its own community."""
+    G = nx.Graph()
+    G.add_nodes_from(["a", "hub"])
+    raw = {0: ["a", "hub"]}
+    _extract_and_reattach_hubs(G, raw, {"hub"})
+    # Hub removed from community 0
+    assert "hub" not in raw[0]
+    # Hub placed in its own community
+    hub_communities = [c for c in raw.values() if "hub" in c]
+    assert len(hub_communities) == 1
+
+
+# --- cluster with conn parameter ---
+
+def test_cluster_with_none_conn_uses_python_path():
+    """cluster() with conn=None should use the Python partitioning path."""
+    G = make_graph()
+    communities = cluster(G, conn=None)
+    assert isinstance(communities, dict)
+    all_nodes = {n for nodes in communities.values() for n in nodes}
+    assert all_nodes == set(G.nodes)
+
+
+def test_cluster_with_failing_conn_falls_back():
+    """cluster() should fall back to Python path when NeuG Leiden fails."""
+    G = make_graph()
+
+    class FailingConn:
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("NeuG connection failed")
+
+    communities = cluster(G, conn=FailingConn())
+    assert isinstance(communities, dict)
+    all_nodes = {n for nodes in communities.values() for n in nodes}
+    assert all_nodes == set(G.nodes)
+
+
+def test_cluster_with_empty_neug_result_falls_back():
+    """cluster() should fall back to Python when NeuG returns empty results."""
+    G = make_graph()
+
+    class EmptyConn:
+        def execute(self, *args, **kwargs):
+            return iter([])
+
+    communities = cluster(G, conn=EmptyConn())
+    assert isinstance(communities, dict)
+    all_nodes = {n for nodes in communities.values() for n in nodes}
+    assert all_nodes == set(G.nodes)
