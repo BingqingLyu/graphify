@@ -165,6 +165,7 @@ def test_full_pipeline_with_mock_leiden(tmp_db):
     import networkx as nx
     from graphify.storage import (
         ingest_extraction, ingest_concepts, get_concept_members,
+        detect_concept_delta,
     )
     from graphify.cluster import cluster as run_leiden_fallback
 
@@ -204,8 +205,9 @@ def test_full_pipeline_with_mock_leiden(tmp_db):
         all_nodes.update(members)
     assert all_nodes == set(G.nodes())
 
-    # Note: detect_concept_delta is now internal to detect_wiki_impact.
-    # The delta detection logic is tested via detect_wiki_impact tests below.
+    # Note: detect_concept_delta requires NeuG GDS Leiden (v0.1.3+)
+    # which isn't available yet. The delta detection logic will be
+    # tested once GDS is available.
 
     _close(db, conn)
 
@@ -394,11 +396,11 @@ def test_import_wiki_auto_detect(tmp_db, tmp_path):
     _close(db, conn)
 
 
-# --- detect_wiki_impact ---
+# --- analyze_wiki_impact ---
 
-def test_detect_wiki_impact_new_concept(tmp_db):
+def test_analyze_wiki_impact_new_concept(tmp_db):
     """A community where >50% of nodes are unknown should be a new concept candidate."""
-    from graphify.storage import detect_wiki_impact, ingest_concepts, ingest_extraction
+    from graphify.storage import analyze_wiki_impact, ingest_concepts, ingest_extraction
     db, conn = _init(tmp_db)
 
     # Ingest base data: 4 existing nodes
@@ -422,7 +424,7 @@ def test_detect_wiki_impact_new_concept(tmp_db):
         "members": ["n1", "n2"],
     }])
 
-    # Delta: 3 new nodes that form a tight cluster (novel concept)
+    # Simulate extract --no-cluster: ingest delta (3 new nodes)
     delta = {
         "nodes": [
             {"id": "x1", "label": "X1", "type": "code", "source_file": "f3.py"},
@@ -434,77 +436,39 @@ def test_detect_wiki_impact_new_concept(tmp_db):
             {"source": "x2", "target": "x3", "relation": "calls"},
         ],
     }
+    ingest_extraction(conn, delta, incremental=True)
 
-    result = detect_wiki_impact(conn, delta)
+    # Now analyze: graph.db has old+new data, concepts still reflect old state
+    result = analyze_wiki_impact(conn)
     assert "new_concept_candidates" in result
     assert "summary" in result
-    assert "structural_context" in result
-    assert "merge" in result["summary"]
     assert result["summary"]["new"] >= 0
     _close(db, conn)
 
 
-def test_detect_wiki_impact_merge(tmp_db):
-    """Two wiki concepts whose members end up in the same community should be detected as merge."""
-    from graphify.storage import detect_wiki_impact, ingest_concepts, ingest_extraction
+def test_analyze_wiki_impact_no_baseline(tmp_db):
+    """When no concepts exist, all communities are reported as new."""
+    from graphify.storage import analyze_wiki_impact, ingest_extraction
     db, conn = _init(tmp_db)
 
-    # Base: n1-n4, two pairs with edges
-    base = {
+    # Ingest some data without any concepts
+    data = {
         "nodes": [
             {"id": "n1", "label": "A", "type": "code", "source_file": "f1.py"},
             {"id": "n2", "label": "B", "type": "code", "source_file": "f1.py"},
-            {"id": "n3", "label": "C", "type": "code", "source_file": "f2.py"},
-            {"id": "n4", "label": "D", "type": "code", "source_file": "f2.py"},
         ],
         "edges": [
             {"source": "n1", "target": "n2", "relation": "calls"},
-            {"source": "n3", "target": "n4", "relation": "calls"},
         ],
     }
-    ingest_extraction(conn, base, incremental=False)
+    ingest_extraction(conn, data, incremental=False)
 
-    # Two wiki concepts covering separate pairs
-    ingest_concepts(conn, [
-        {"id": "wiki_a", "name": "Concept A", "source": "wiki", "members": ["n1", "n2"]},
-        {"id": "wiki_b", "name": "Concept B", "source": "wiki", "members": ["n3", "n4"]},
-    ])
-
-    # Delta: bridge node + cross-edges connecting both pairs
-    delta = {
-        "nodes": [
-            {"id": "bridge", "label": "Bridge", "type": "code", "source_file": "f3.py"},
-        ],
-        "edges": [
-            {"source": "n1", "target": "bridge", "relation": "calls"},
-            {"source": "bridge", "target": "n3", "relation": "calls"},
-            {"source": "n2", "target": "bridge", "relation": "calls"},
-            {"source": "bridge", "target": "n4", "relation": "calls"},
-        ],
-    }
-
-    # Mock Leiden: force all nodes into a single community
-    def _mock_leiden(conn, resolution):
-        return {0: ["n1", "n2", "n3", "n4", "bridge"]}
-
-    result = detect_wiki_impact(conn, delta, leiden_fn=_mock_leiden)
-    merges = [
-        (cid, info) for cid, info in result["concept_changes"].items()
-        if info["type"] == "merge"
-    ]
-    # At least one concept should be marked as merge
-    assert len(merges) >= 1, f"Expected merge detection, got: {result['concept_changes']}"
-    _close(db, conn)
-
-
-def test_detect_wiki_impact_temp_mode_unsupported(tmp_db):
-    """temp mode should raise NotImplementedError."""
-    from graphify.storage import detect_wiki_impact
-    db, conn = _init(tmp_db)
-
-    with pytest.raises(NotImplementedError):
-        detect_wiki_impact(conn, {"nodes": [], "edges": []}, mode="temp")
-
+    result = analyze_wiki_impact(conn)
+    # No old concepts → no concept_changes, everything is new
+    assert result["concept_changes"] == {}
+    assert result["summary"]["stable"] == 0
+    # All communities should be new concept candidates (novelty_ratio = 1.0)
+    assert result["summary"]["new"] >= 1
     _close(db, conn)
 
 

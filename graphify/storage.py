@@ -828,57 +828,34 @@ def _get_wiki_concepts(conn: object) -> dict[str, dict]:
     return result
 
 
-def detect_wiki_impact(
+def analyze_wiki_impact(
     conn: object,
-    delta_extraction: dict,
     resolution: float = 1.0,
     *,
-    mode: str = "persistent",
     leiden_fn: callable | None = None,
 ) -> dict:
-    """Analyze how incremental raw data affects existing wiki knowledge.
+    """Run Leiden on current graph.db and compare with existing concepts.
 
-    Two-layer analysis:
-    Layer 1 (structural): Load delta data, run Leiden, compare new
-    communities with existing concepts to detect split / growth / merge /
-    dissolved / stable / new concept candidates. Also detect new / stale
-    links between concepts.
+    Precondition: graph.db has been updated with new nodes/edges
+    (via extract --no-cluster) but concepts are still from the
+    previous clustering pass.
 
-    Layer 2 (optional, done by caller): LLM naming for new concept
-    candidates and new link rationales.
+    If no concepts exist yet, all communities are reported as new.
 
-    mode="persistent" (default): ingest delta into graph.db, then re-run
-    Leiden on full graph.
-    mode="temp": load delta as COPY TEMP, analyze without modifying
-    persistent data. Currently unsupported — requires NeuG GDS Leiden
-    to support multi-node-type projected graphs.
+    leiden_fn: optional custom Leiden function for testing. Accepts
+    (conn, resolution) and returns {community_id: [node_ids]}.
 
-    leiden_fn: optional custom Leiden function for testing. If None,
-    uses NeuG GDS Leiden. Accepts (conn, resolution) and returns
-    {community_id: [node_ids]}.
+    Returns::
 
-    Returns:
         {
             'concept_changes': {concept_id: {'type': str, ...}},
             'new_concept_candidates': [{'community_id': int, ...}],
             'link_changes': {'new_links': [...], 'stale_links': [...]},
-            'structural_context': {concept_id: {'type': str}},
             'new_communities': {cid: [node_ids]},
-            'summary': {'split': int, 'growth': int, 'merge': int, ...},
+            'summary': {'split': int, 'growth': int, ...},
         }
     """
-    # Step 1: Load delta data
-    if mode == "persistent":
-        ingest_extraction(conn, delta_extraction, incremental=True)
-    elif mode == "temp":
-        raise NotImplementedError(
-            "temp mode requires NeuG GDS Leiden to support multi-node-type "
-            "projected graphs. Use mode='persistent' (default)."
-        )
-    else:
-        raise ValueError(f"Unknown mode: {mode!r}")
-
-    # Step 2: Query existing concepts + members + links
+    # Step 1: Query existing concepts + members + links
     old_concepts = _get_wiki_concepts(conn)
     old_members = get_concept_members(conn)
     old_links = _get_concept_links(conn)
@@ -889,7 +866,7 @@ def detect_wiki_impact(
         for nid in nids:
             node_to_concept[nid] = cid
 
-    # Step 3: Run Leiden on full graph (with delta ingested)
+    # Step 2: Run Leiden on full graph
     if leiden_fn is not None:
         new_communities = leiden_fn(conn, resolution)
     else:
@@ -901,8 +878,7 @@ def detect_wiki_impact(
         for nid in nids:
             node_to_new_comm[nid] = cid
 
-    # Step 4: Detect concept changes
-    # Backward: each old concept → new targets (split / growth / dissolved / stable)
+    # Step 3: Detect concept changes (split / growth / dissolved / stable)
     concept_changes: dict[str, dict] = {}
 
     for old_cid, old_nodes in old_members.items():
@@ -938,29 +914,7 @@ def detect_wiki_impact(
                 },
             }
 
-    # Forward: detect merges (multiple concepts' members now in same community)
-    comm_to_concepts: dict[int, set[str]] = {}
-    for old_cid, old_nodes in old_members.items():
-        for nid in old_nodes:
-            new_cid = node_to_new_comm.get(nid)
-            if new_cid is not None:
-                comm_to_concepts.setdefault(new_cid, set()).add(old_cid)
-
-    for new_cid, concepts in comm_to_concepts.items():
-        if len(concepts) > 1:
-            for cid in concepts:
-                prev = concept_changes.get(cid, {})
-                if prev.get("type") in ("stable", "growth"):
-                    entry: dict = {
-                        "type": "merge",
-                        "merged_with": sorted(concepts - {cid}),
-                        "new_community": new_cid,
-                    }
-                    if prev.get("type") == "growth":
-                        entry["new_members"] = prev.get("new_members", [])
-                    concept_changes[cid] = entry
-
-    # Step 5: Detect new concept candidates
+    # Step 4: Detect new concept candidates
     # A community where >50% of nodes don't belong to any existing concept
     new_concept_candidates: list[dict] = []
 
@@ -978,8 +932,8 @@ def detect_wiki_impact(
                 )),
             })
 
-    # Step 6: Detect link changes between concepts
-    # New links: concepts whose members now share the same new community
+    # Step 5: Detect link changes between concepts
+    # New links: wiki concepts whose members now share the same new community
     # (suggesting structural connection) but don't have a links_to edge
     co_occurring: dict[tuple[str, str], int] = {}
     for new_cid, members in new_communities.items():
@@ -1012,17 +966,10 @@ def detect_wiki_impact(
                 "to": c2,
             })
 
-    # Step 7: Structural context (lightweight summary of structural changes)
-    structural_context = {
-        cid: {"type": c["type"]}
-        for cid, c in concept_changes.items()
-    }
-
     # Summary
     summary = {
         "split": sum(1 for c in concept_changes.values() if c["type"] == "split"),
         "growth": sum(1 for c in concept_changes.values() if c["type"] == "growth"),
-        "merge": sum(1 for c in concept_changes.values() if c["type"] == "merge"),
         "dissolved": sum(1 for c in concept_changes.values() if c["type"] == "dissolved"),
         "stable": sum(1 for c in concept_changes.values() if c["type"] == "stable"),
         "new": len(new_concept_candidates),
@@ -1037,7 +984,6 @@ def detect_wiki_impact(
             "new_links": new_links,
             "stale_links": stale_links,
         },
-        "structural_context": structural_context,
         "new_communities": new_communities,
         "summary": summary,
     }

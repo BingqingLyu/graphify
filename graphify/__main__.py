@@ -2272,8 +2272,7 @@ def main() -> None:
         print("  import-wiki <path>       import wiki concepts into graph.db")
         print("    --format auto|graph-json|okf  input format (default: auto-detect)")
         print("    --db <path>             path to graph.db")
-        print("  wiki-impact --delta P    analyze how raw changes affect wiki knowledge")
-        print("    --mode persistent|temp  persistent = ingest into graph.db (default)")
+        print("  wiki-impact [path]       analyze how graph changes affect wiki concepts")
         print("    --format text|json      output format")
         print("    --backend B             LLM backend for naming new concepts (optional)")
         print("    --model M               override backend model")
@@ -3497,34 +3496,9 @@ def main() -> None:
         print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
         stages.mark("load")
 
-        # Try NeuG Leiden (graph.db already has data from extract).
-        # Fall back to Python cluster() if NeuG not available.
-        _neug_conn = None
-        _neug_db = None
-        try:
-            from graphify.storage import init_db as _init_db, run_leiden as _run_leiden, close_db as _close_db
-            from graphify.cluster import postprocess_communities
-            _db_path = watch_path / _GRAPHIFY_OUT / "graph.db"
-            if _db_path.exists():
-                _neug_db, _neug_conn = _init_db(str(_db_path))
-        except (ImportError, Exception):
-            _neug_conn = None
-
         print("Re-clustering...")
-        if _neug_conn is not None:
-            try:
-                _raw_communities = _run_leiden(_neug_conn, resolution=co_resolution)
-                communities = postprocess_communities(G, _raw_communities)
-                print(f"NeuG Leiden: {len(communities)} communities")
-            except Exception as exc:
-                print(f"NeuG Leiden failed ({exc}), falling back to Python", file=sys.stderr)
-                communities = cluster(G, resolution=co_resolution,
-                                      exclude_hubs_percentile=co_exclude_hubs)
-            finally:
-                _close_db(_neug_db, _neug_conn)
-        else:
-            communities = cluster(G, resolution=co_resolution,
-                                  exclude_hubs_percentile=co_exclude_hubs)
+        communities = cluster(G, resolution=co_resolution,
+                              exclude_hubs_percentile=co_exclude_hubs)
 
         # Mirror the watch/update path (#822): map new cids to prior ones by
         # node-overlap so the existing .graphify_labels.json keeps attaching
@@ -3603,23 +3577,6 @@ def main() -> None:
         _backup(out)
         to_json(G, communities, str(out / "graph.json"), community_labels=labels)
         labels_path.write_text(json.dumps({str(k): v for k, v in labels.items()}, ensure_ascii=False), encoding="utf-8")
-        try:
-            from graphify.storage import init_db as _init_db, ensure_schema as _ensure_schema, ingest_concepts as _ingest_concepts, close_db as _close_db
-            _db_path = str(out / "graph.db")
-            if Path(_db_path).exists():
-                _db, _conn = _init_db(_db_path)
-                _ensure_schema(_conn, create_tables=False)
-                _ingest_concepts(_conn, [
-                    {"id": f"concept_{cid}", "name": labels.get(cid, f"Community {cid}"),
-                     "source": "leiden", "members": members}
-                    for cid, members in communities.items()
-                ])
-                _close_db(_db, _conn)
-                print("[graphify cluster-only] graph.db concepts updated (powered by NeuG)")
-        except ImportError:
-            pass
-        except Exception as _exc:
-            print(f"[graphify cluster-only] warning: NeuG concept update failed: {_exc}", file=sys.stderr)
 
         # Mirror watch.py pattern: gate to_html so core outputs (graph.json +
         # GRAPH_REPORT.md) always land. Honor --no-viz explicitly; otherwise
@@ -5217,23 +5174,18 @@ def main() -> None:
         print(f"Imported {count} concepts from {import_path}")
 
     elif cmd == "wiki-impact":
-        # graphify wiki-impact --delta <path> [--mode persistent|temp]
-        #                        [--format text|json] [--backend B] [--model M]
-        # Analyze how incremental raw data affects wiki knowledge.
-        wiki_delta_path: Path | None = None
-        wiki_mode = "persistent"
+        # graphify wiki-impact [path] [--format text|json] [--backend B] [--model M]
+        # Analyze how graph changes (from extract --no-cluster) affect wiki concepts.
         wiki_out_format = "text"
         wiki_backend: str | None = None
         wiki_model: str | None = None
         _wiki_watch: Path | None = None
         i = 2
         while i < len(sys.argv):
-            if sys.argv[i] == "--delta" and i + 1 < len(sys.argv):
-                wiki_delta_path = Path(sys.argv[i + 1]); i += 2
-            elif sys.argv[i] == "--mode" and i + 1 < len(sys.argv):
-                wiki_mode = sys.argv[i + 1]; i += 2
-            elif sys.argv[i] == "--format" and i + 1 < len(sys.argv):
+            if sys.argv[i] == "--format" and i + 1 < len(sys.argv):
                 wiki_out_format = sys.argv[i + 1]; i += 2
+            elif sys.argv[i].startswith("--format="):
+                wiki_out_format = sys.argv[i].split("=", 1)[1]; i += 1
             elif sys.argv[i] == "--backend" and i + 1 < len(sys.argv):
                 wiki_backend = sys.argv[i + 1]; i += 2
             elif sys.argv[i].startswith("--backend="):
@@ -5242,24 +5194,14 @@ def main() -> None:
                 wiki_model = sys.argv[i + 1]; i += 2
             elif sys.argv[i].startswith("--model="):
                 wiki_model = sys.argv[i].split("=", 1)[1]; i += 1
-            elif sys.argv[i].startswith("--mode="):
-                wiki_mode = sys.argv[i].split("=", 1)[1]; i += 1
-            elif sys.argv[i].startswith("--format="):
-                wiki_out_format = sys.argv[i].split("=", 1)[1]; i += 1
             elif not sys.argv[i].startswith("--"):
                 _wiki_watch = Path(sys.argv[i]); i += 1
             else:
                 i += 1
-        if wiki_delta_path is None:
-            print("Usage: graphify wiki-impact --delta <path> [--mode persistent|temp] [--format text|json] [--backend B] [--model M]", file=sys.stderr)
-            sys.exit(1)
-        if not wiki_delta_path.exists():
-            print(f"error: delta file not found: {wiki_delta_path}", file=sys.stderr)
-            sys.exit(1)
         if _wiki_watch is None:
             _wiki_watch = Path(".")
         try:
-            from graphify.storage import init_db, ensure_schema, detect_wiki_impact, close_db
+            from graphify.storage import init_db, ensure_schema, analyze_wiki_impact, close_db
         except ImportError:
             print("error: neug is not installed. Run: pip install neug", file=sys.stderr)
             sys.exit(1)
@@ -5268,11 +5210,10 @@ def main() -> None:
         if not Path(_db_path).exists():
             print(f"error: no graph.db found at {_db_path} — run `graphify extract` first", file=sys.stderr)
             sys.exit(1)
-        _delta_data = json.loads(wiki_delta_path.read_text(encoding="utf-8"))
         _db, _conn = init_db(_db_path)
         ensure_schema(_conn, create_tables=False)
         try:
-            _result = detect_wiki_impact(_conn, _delta_data, mode=wiki_mode)
+            _result = analyze_wiki_impact(_conn)
         finally:
             close_db(_db, _conn)
 
@@ -5312,7 +5253,7 @@ def main() -> None:
             print(json.dumps(_serializable, indent=2, default=str))
         else:
             _sum = _result["summary"]
-            print(f"Wiki impact ({wiki_mode} mode):")
+            print(f"Wiki impact:")
             print(f"  concept changes:")
             print(f"    stable:    {_sum.get('stable', 0)}")
             print(f"    growth:    {_sum.get('growth', 0)}")
