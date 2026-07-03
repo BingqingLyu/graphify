@@ -832,6 +832,7 @@ def analyze_wiki_impact(
     conn: object,
     resolution: float = 1.0,
     *,
+    min_concept_size: int = 1,
     baseline_concepts: list[dict] | None = None,
     leiden_fn: callable | None = None,
 ) -> dict:
@@ -843,6 +844,9 @@ def analyze_wiki_impact(
 
     If no concepts exist yet, all communities are reported as new.
 
+    min_concept_size: ignore baseline concepts with fewer members than
+    this threshold. Also filters new concept candidates below this size.
+    Default 1 (no filtering).
     baseline_concepts: optional list of concept dicts to use as baseline
     instead of querying graph.db. Each dict should have 'id', 'name',
     'members' (list of node IDs), and optionally 'links' (list of
@@ -876,7 +880,9 @@ def analyze_wiki_impact(
         old_members = get_concept_members(conn)
         old_links = _get_concept_links(conn)
 
-    # Build node → concept_id lookup
+    # Build node → concept_id lookup (after filtering by min_concept_size)
+    if min_concept_size > 1:
+        old_members = {cid: nids for cid, nids in old_members.items() if len(nids) >= min_concept_size}
     node_to_concept: dict[str, str] = {}
     for cid, nids in old_members.items():
         for nid in nids:
@@ -938,7 +944,7 @@ def analyze_wiki_impact(
         known = sum(1 for n in members if n in node_to_concept)
         novelty_ratio = 1.0 - (known / len(members)) if members else 0.0
 
-        if novelty_ratio > 0.5:
+        if novelty_ratio > 0.5 and len(members) >= min_concept_size:
             new_concept_candidates.append({
                 "community_id": new_cid,
                 "members": sorted(members),
@@ -1044,14 +1050,16 @@ def neug_sync(
                       prune_sources=prune_sources, root=root)
 
     if communities is not None:
-        try:
-            ingest_concepts(conn, [
-                {"id": f"concept_{cid}", "name": f"Community {cid}",
-                 "source": "leiden", "members": members}
-                for cid, members in communities.items()
-            ])
-        except Exception:
-            pass
+        if communities:  # Non-empty: write concepts
+            try:
+                ingest_concepts(conn, [
+                    {"id": f"concept_{cid}", "name": f"Community {cid}",
+                     "source": "leiden", "members": members}
+                    for cid, members in communities.items()
+                ])
+            except Exception:
+                pass
+        # communities provided (even empty) → close and return None
         close_db(db, conn)
         return None
 
@@ -1062,6 +1070,7 @@ def neug_sync(
 def run_wiki_impact(
     db_path: str,
     *,
+    min_concept_size: int = 1,
     baseline_path: str | None = None,
     graph_json_path: str | None = None,
     backend: str | None = None,
@@ -1076,6 +1085,7 @@ def run_wiki_impact(
     4. Return result dict
 
     db_path: path to graph.db
+    min_concept_size: filter out concepts with fewer members (default 1)
     baseline_path: optional external wiki path (auto-detect format)
     graph_json_path: path to graph.json (for LLM naming context)
     backend: LLM backend for naming new concepts (optional)
@@ -1101,7 +1111,7 @@ def run_wiki_impact(
     db, conn = init_db(db_path)
     ensure_schema(conn, create_tables=False)
     try:
-        result = analyze_wiki_impact(conn, baseline_concepts=baseline_concepts)
+        result = analyze_wiki_impact(conn, min_concept_size=min_concept_size, baseline_concepts=baseline_concepts)
     finally:
         close_db(db, conn)
 

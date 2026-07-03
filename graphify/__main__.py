@@ -2271,6 +2271,7 @@ def main() -> None:
         print("    --db <path>             path to graph.db (default graphify-out/graph.db)")
         print("  wiki-impact [path]       analyze how graph changes affect wiki concepts")
         print("    --baseline <path>       use external wiki as baseline (default: graph.db concepts)")
+        print("    --min-concept-size N    ignore concepts with fewer than N members (default 3)")
         print("    --format text|json      output format")
         print("    --backend B             LLM backend for naming new concepts (optional)")
         print("    --model M               override backend model")
@@ -5130,6 +5131,7 @@ def main() -> None:
         wiki_backend: str | None = None
         wiki_model: str | None = None
         wiki_baseline: Path | None = None
+        wiki_min_size: int = 3
         _wiki_watch: Path | None = None
         i = 2
         while i < len(sys.argv):
@@ -5141,6 +5143,10 @@ def main() -> None:
                 wiki_baseline = Path(sys.argv[i + 1]); i += 2
             elif sys.argv[i].startswith("--baseline="):
                 wiki_baseline = Path(sys.argv[i].split("=", 1)[1]); i += 1
+            elif sys.argv[i] == "--min-concept-size" and i + 1 < len(sys.argv):
+                wiki_min_size = int(sys.argv[i + 1]); i += 2
+            elif sys.argv[i].startswith("--min-concept-size="):
+                wiki_min_size = int(sys.argv[i].split("=", 1)[1]); i += 1
             elif sys.argv[i] == "--backend" and i + 1 < len(sys.argv):
                 wiki_backend = sys.argv[i + 1]; i += 2
             elif sys.argv[i].startswith("--backend="):
@@ -5172,6 +5178,7 @@ def main() -> None:
 
         _result = _run_wiki_impact(
             _db_path,
+            min_concept_size=wiki_min_size,
             baseline_path=str(wiki_baseline) if wiki_baseline else None,
             graph_json_path=str(_graphify_out / "graph.json"),
             backend=wiki_backend,
@@ -5199,22 +5206,56 @@ def main() -> None:
             print(f"  new concepts:  {_sum.get('new', 0)}")
             print(f"  new links:     {_sum.get('new_links', 0)}")
             print(f"  stale links:   {_sum.get('stale_links', 0)}")
-            for _cid, _info in _result["concept_changes"].items():
-                if _info["type"] != "stable":
-                    print(f"  [{_info['type']}] {_cid}")
+            # Detail: split
+            _splits = [(cid, info) for cid, info in _result["concept_changes"].items() if info["type"] == "split"]
+            if _splits:
+                print(f"  --- split ({len(_splits)}) ---")
+                for _cid, _info in _splits:
+                    _old_n = len(_info.get('old_members', []))
+                    _into = _info.get('split_into', {})
+                    print(f"    {_cid} ({_old_n} members) -> {len(_into)} sub-communities")
+            # Detail: growth (top 10 by growth size)
+            _growths = [(cid, info) for cid, info in _result["concept_changes"].items() if info["type"] == "growth"]
+            if _growths:
+                _growths.sort(key=lambda x: len(x[1].get('new_members', [])) - len(x[1].get('old_members', [])), reverse=True)
+                _show = _growths[:10]
+                print(f"  --- growth (top {len(_show)} of {len(_growths)}) ---")
+                for _cid, _info in _show:
+                    _old_n = len(_info.get('old_members', []))
+                    _new_n = len(_info.get('new_members', []))
+                    print(f"    {_cid}: {_old_n} -> {_new_n} members (+{_new_n - _old_n})")
+            # Detail: dissolved
+            _dissolved = [(cid, info) for cid, info in _result["concept_changes"].items() if info["type"] == "dissolved"]
+            if _dissolved:
+                print(f"  --- dissolved ({len(_dissolved)}) ---")
+                for _cid, _info in _dissolved:
+                    print(f"    {_cid} ({len(_info.get('old_members', []))} members lost)")
+            # Detail: merge
+            _merges = [(cid, info) for cid, info in _result["concept_changes"].items() if info["type"] == "merge"]
+            if _merges:
+                print(f"  --- merge ({len(_merges)}) ---")
+                for _cid, _info in _merges:
+                    print(f"    {_cid} merged with {_info.get('merged_with', [])}")
+            # Detail: new concept candidates
             if _result["new_concept_candidates"]:
-                print("  --- new concept candidates ---")
+                print(f"  --- new concept candidates ({len(_result['new_concept_candidates'])}) ---")
                 for c in _result["new_concept_candidates"]:
                     _name = c.get("name", f"Community {c['community_id']}")
-                    print(f"    {_name} (novelty: {c['novelty_ratio']}, members: {len(c['members'])})")
+                    _members = c['members']
+                    _preview = ', '.join(_members[:5])
+                    _suffix = f", ..." if len(_members) > 5 else ""
+                    print(f"    {_name} ({len(_members)} members, novelty: {c['novelty_ratio']})")
+                    print(f"      [{_preview}{_suffix}]")
             _lc = _result["link_changes"]
             if _lc["new_links"]:
-                print("  --- new links ---")
-                for _link in _lc["new_links"]:
+                _nl = _lc["new_links"]
+                print(f"  --- new links ({len(_nl)}, showing top 10) ---")
+                _nl_sorted = sorted(_nl, key=lambda x: -x['co_occurrence'])
+                for _link in _nl_sorted[:10]:
                     print(f"    {_link['from']} -> {_link['to']} (co-occurrence: {_link['co_occurrence']})")
             if _lc["stale_links"]:
-                print("  --- stale links ---")
-                for _link in _lc["stale_links"]:
+                print(f"  --- stale links ({len(_lc['stale_links'])}) ---")
+                for _link in _lc["stale_links"][:10]:
                     print(f"    {_link['from']} -> {_link['to']}")
 
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
