@@ -5176,88 +5176,16 @@ def main() -> None:
             print(f"error: baseline path not found: {wiki_baseline}", file=sys.stderr)
             sys.exit(1)
 
-        _result = _run_wiki_impact(
+        _output = _run_wiki_impact(
             _db_path,
             min_concept_size=wiki_min_size,
             baseline_path=str(wiki_baseline) if wiki_baseline else None,
             graph_json_path=str(_graphify_out / "graph.json"),
             backend=wiki_backend,
             model=wiki_model,
+            output_format=wiki_out_format,
         )
-
-        if wiki_out_format == "json":
-            _serializable = {
-                "concept_changes": _result["concept_changes"],
-                "new_concept_candidates": _result["new_concept_candidates"],
-                "link_changes": _result["link_changes"],
-                "structural_context": _result.get("structural_context", {}),
-                "summary": _result["summary"],
-            }
-            print(json.dumps(_serializable, indent=2, default=str))
-        else:
-            _sum = _result["summary"]
-            print(f"Wiki impact:")
-            print(f"  concept changes:")
-            print(f"    stable:    {_sum.get('stable', 0)}")
-            print(f"    growth:    {_sum.get('growth', 0)}")
-            print(f"    merge:     {_sum.get('merge', 0)}")
-            print(f"    split:     {_sum.get('split', 0)}")
-            print(f"    dissolved: {_sum.get('dissolved', 0)}")
-            print(f"  new concepts:  {_sum.get('new', 0)}")
-            print(f"  new links:     {_sum.get('new_links', 0)}")
-            print(f"  stale links:   {_sum.get('stale_links', 0)}")
-            # Detail: split
-            _splits = [(cid, info) for cid, info in _result["concept_changes"].items() if info["type"] == "split"]
-            if _splits:
-                print(f"  --- split ({len(_splits)}) ---")
-                for _cid, _info in _splits:
-                    _old_n = len(_info.get('old_members', []))
-                    _into = _info.get('split_into', {})
-                    print(f"    {_cid} ({_old_n} members) -> {len(_into)} sub-communities")
-            # Detail: growth (top 10 by growth size)
-            _growths = [(cid, info) for cid, info in _result["concept_changes"].items() if info["type"] == "growth"]
-            if _growths:
-                _growths.sort(key=lambda x: len(x[1].get('new_members', [])) - len(x[1].get('old_members', [])), reverse=True)
-                _show = _growths[:10]
-                print(f"  --- growth (top {len(_show)} of {len(_growths)}) ---")
-                for _cid, _info in _show:
-                    _old_n = len(_info.get('old_members', []))
-                    _new_n = len(_info.get('new_members', []))
-                    print(f"    {_cid}: {_old_n} -> {_new_n} members (+{_new_n - _old_n})")
-            # Detail: dissolved
-            _dissolved = [(cid, info) for cid, info in _result["concept_changes"].items() if info["type"] == "dissolved"]
-            if _dissolved:
-                print(f"  --- dissolved ({len(_dissolved)}) ---")
-                for _cid, _info in _dissolved:
-                    print(f"    {_cid} ({len(_info.get('old_members', []))} members lost)")
-            # Detail: merge
-            _merges = [(cid, info) for cid, info in _result["concept_changes"].items() if info["type"] == "merge"]
-            if _merges:
-                print(f"  --- merge ({len(_merges)}) ---")
-                for _cid, _info in _merges:
-                    print(f"    {_cid} merged with {_info.get('merged_with', [])}")
-            # Detail: new concept candidates
-            if _result["new_concept_candidates"]:
-                print(f"  --- new concept candidates ({len(_result['new_concept_candidates'])}) ---")
-                for c in _result["new_concept_candidates"]:
-                    _name = c.get("name", f"Community {c['community_id']}")
-                    _members = c['members']
-                    _preview = ', '.join(_members[:5])
-                    _suffix = f", ..." if len(_members) > 5 else ""
-                    print(f"    {_name} ({len(_members)} members, novelty: {c['novelty_ratio']})")
-                    print(f"      [{_preview}{_suffix}]")
-            _lc = _result["link_changes"]
-            if _lc["new_links"]:
-                _nl = _lc["new_links"]
-                print(f"  --- new links ({len(_nl)}, showing top 10) ---")
-                _nl_sorted = sorted(_nl, key=lambda x: -x['co_occurrence'])
-                for _link in _nl_sorted[:10]:
-                    print(f"    {_link['from']} -> {_link['to']} (co-occurrence: {_link['co_occurrence']})")
-            if _lc["stale_links"]:
-                print(f"  --- stale links ({len(_lc['stale_links'])}) ---")
-                for _link in _lc["stale_links"][:10]:
-                    print(f"    {_link['from']} -> {_link['to']}")
-
+        print(_output)
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
         # User ran `graphify <path>` directly — treat as `graphify extract <path>`.
         # Common when following the PowerShell note in README (`graphify .`) or

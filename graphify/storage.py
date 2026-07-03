@@ -1075,14 +1075,9 @@ def run_wiki_impact(
     graph_json_path: str | None = None,
     backend: str | None = None,
     model: str | None = None,
-) -> dict:
-    """Run wiki-impact analysis end-to-end.
-
-    Encapsulates the full wiki-impact business logic:
-    1. Load baseline concepts (from external wiki or graph.db)
-    2. Open graph.db, run Leiden, compare
-    3. Optionally name new concepts via LLM
-    4. Return result dict
+    output_format: str = "text",
+) -> str:
+    """Run wiki-impact analysis end-to-end and return formatted output.
 
     db_path: path to graph.db
     min_concept_size: filter out concepts with fewer members (default 1)
@@ -1090,8 +1085,12 @@ def run_wiki_impact(
     graph_json_path: path to graph.json (for LLM naming context)
     backend: LLM backend for naming new concepts (optional)
     model: override LLM model
+    output_format: 'text' or 'json'
+
+    Returns formatted string (text report or JSON).
     """
     from pathlib import Path
+    import json as _json
 
     # Load external baseline if specified
     baseline_concepts: list[dict] | None = None
@@ -1120,7 +1119,6 @@ def run_wiki_impact(
         gj = Path(graph_json_path)
         if gj.exists():
             try:
-                import json as _json
                 from graphify.build import build_from_json
                 from graphify.llm import label_communities, detect_backend as _detect_backend
                 raw_data = _json.loads(gj.read_text(encoding="utf-8"))
@@ -1139,7 +1137,96 @@ def run_wiki_impact(
             except Exception:
                 pass  # LLM naming is best-effort
 
-    return result
+    # Format output
+    if output_format == "json":
+        serializable = {
+            "concept_changes": result["concept_changes"],
+            "new_concept_candidates": result["new_concept_candidates"],
+            "link_changes": result["link_changes"],
+            "structural_context": result.get("structural_context", {}),
+            "summary": result["summary"],
+        }
+        return _json.dumps(serializable, indent=2, default=str)
+
+    return _format_wiki_impact_text(result)
+
+
+def _format_wiki_impact_text(result: dict) -> str:
+    """Format wiki-impact result as human-readable text."""
+    lines: list[str] = []
+    _sum = result["summary"]
+    lines.append("Wiki impact:")
+    lines.append("  concept changes:")
+    lines.append(f"    stable:    {_sum.get('stable', 0)}")
+    lines.append(f"    growth:    {_sum.get('growth', 0)}")
+    lines.append(f"    merge:     {_sum.get('merge', 0)}")
+    lines.append(f"    split:     {_sum.get('split', 0)}")
+    lines.append(f"    dissolved: {_sum.get('dissolved', 0)}")
+    lines.append(f"  new concepts:  {_sum.get('new', 0)}")
+    lines.append(f"  new links:     {_sum.get('new_links', 0)}")
+    lines.append(f"  stale links:   {_sum.get('stale_links', 0)}")
+
+    # Split details
+    splits = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "split"]
+    if splits:
+        lines.append(f"  --- split ({len(splits)}) ---")
+        for cid, info in splits:
+            old_n = len(info.get('old_members', []))
+            into = info.get('split_into', {})
+            lines.append(f"    {cid} ({old_n} members) -> {len(into)} sub-communities")
+
+    # Growth details (top 10)
+    growths = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "growth"]
+    if growths:
+        growths.sort(key=lambda x: len(x[1].get('new_members', [])) - len(x[1].get('old_members', [])), reverse=True)
+        show = growths[:10]
+        lines.append(f"  --- growth (top {len(show)} of {len(growths)}) ---")
+        for cid, info in show:
+            old_n = len(info.get('old_members', []))
+            new_n = len(info.get('new_members', []))
+            lines.append(f"    {cid}: {old_n} -> {new_n} members (+{new_n - old_n})")
+
+    # Dissolved details
+    dissolved = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "dissolved"]
+    if dissolved:
+        lines.append(f"  --- dissolved ({len(dissolved)}) ---")
+        for cid, info in dissolved:
+            lines.append(f"    {cid} ({len(info.get('old_members', []))} members lost)")
+
+    # Merge details
+    merges = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "merge"]
+    if merges:
+        lines.append(f"  --- merge ({len(merges)}) ---")
+        for cid, info in merges:
+            lines.append(f"    {cid} merged with {info.get('merged_with', [])}")
+
+    # New concept candidates
+    candidates = result.get("new_concept_candidates", [])
+    if candidates:
+        lines.append(f"  --- new concept candidates ({len(candidates)}) ---")
+        for c in candidates:
+            name = c.get("name", f"Community {c['community_id']}")
+            members = c['members']
+            preview = ', '.join(members[:5])
+            suffix = ", ..." if len(members) > 5 else ""
+            lines.append(f"    {name} ({len(members)} members, novelty: {c['novelty_ratio']})")
+            lines.append(f"      [{preview}{suffix}]")
+
+    # Link changes
+    lc = result.get("link_changes", {})
+    new_links = lc.get("new_links", [])
+    if new_links:
+        lines.append(f"  --- new links ({len(new_links)}, showing top 10) ---")
+        nl_sorted = sorted(new_links, key=lambda x: -x['co_occurrence'])
+        for link in nl_sorted[:10]:
+            lines.append(f"    {link['from']} -> {link['to']} (co-occurrence: {link['co_occurrence']})")
+    stale_links = lc.get("stale_links", [])
+    if stale_links:
+        lines.append(f"  --- stale links ({len(stale_links)}) ---")
+        for link in stale_links[:10]:
+            lines.append(f"    {link['from']} -> {link['to']}")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
