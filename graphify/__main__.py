@@ -2269,10 +2269,8 @@ def main() -> None:
         print("    --batch-size=N          communities per labeling LLM call (default 100)")
         print("  cypher \"MATCH ...\"       execute a Cypher query against graph.db (requires neug)")
         print("    --db <path>             path to graph.db (default graphify-out/graph.db)")
-        print("  import-wiki <path>       import wiki concepts into graph.db")
-        print("    --format auto|graph-json|okf  input format (default: auto-detect)")
-        print("    --db <path>             path to graph.db")
         print("  wiki-impact [path]       analyze how graph changes affect wiki concepts")
+        print("    --baseline <path>       use external wiki as baseline (default: graph.db concepts)")
         print("    --format text|json      output format")
         print("    --backend B             LLM backend for naming new concepts (optional)")
         print("    --model M               override backend model")
@@ -5129,56 +5127,14 @@ def main() -> None:
         out_path2.write_text(json.dumps(merged2, ensure_ascii=False), encoding="utf-8")
         print(f"Merged: {len(merged2['nodes'])} nodes, {len(merged2['edges'])} edges")
 
-    elif cmd == "import-wiki":
-        # graphify import-wiki <path> [--format auto|graph-json|okf] [--db <path>]
-        import_path: Path | None = None
-        import_format = "auto"
-        import_db: Path | None = None
-        i = 2
-        while i < len(sys.argv):
-            if sys.argv[i] == "--format" and i + 1 < len(sys.argv):
-                import_format = sys.argv[i + 1]; i += 2
-            elif sys.argv[i].startswith("--format="):
-                import_format = sys.argv[i].split("=", 1)[1]; i += 1
-            elif sys.argv[i] == "--db" and i + 1 < len(sys.argv):
-                import_db = Path(sys.argv[i + 1]); i += 2
-            elif sys.argv[i].startswith("--db="):
-                import_db = Path(sys.argv[i].split("=", 1)[1]); i += 1
-            elif not sys.argv[i].startswith("--"):
-                import_path = Path(sys.argv[i]); i += 1
-            else:
-                i += 1
-        if import_path is None:
-            print("Usage: graphify import-wiki <path> [--format auto|graph-json|okf] [--db <path>]", file=sys.stderr)
-            sys.exit(1)
-        if not import_path.exists():
-            print(f"error: path not found: {import_path}", file=sys.stderr)
-            sys.exit(1)
-        try:
-            from graphify.storage import init_db, ensure_schema, import_wiki, close_db
-        except ImportError:
-            print("error: neug is not installed. Run: pip install neug", file=sys.stderr)
-            sys.exit(1)
-        if import_db is None:
-            _graphify_out = Path(".") / _GRAPHIFY_OUT
-            import_db = _graphify_out / "graph.db"
-        if not import_db.exists():
-            print(f"error: no graph.db found at {import_db} — run `graphify extract` first or use --db", file=sys.stderr)
-            sys.exit(1)
-        _db, _conn = init_db(str(import_db))
-        ensure_schema(_conn, create_tables=False)
-        try:
-            count = import_wiki(_conn, import_path, format=import_format)
-        finally:
-            close_db(_db, _conn)
-        print(f"Imported {count} concepts from {import_path}")
-
     elif cmd == "wiki-impact":
-        # graphify wiki-impact [path] [--format text|json] [--backend B] [--model M]
-        # Analyze how graph changes (from extract --no-cluster) affect wiki concepts.
+        # graphify wiki-impact [path] [--baseline <wiki-path>] [--format text|json]
+        #                       [--backend B] [--model M]
+        # Analyze how graph changes affect wiki concepts.
         wiki_out_format = "text"
         wiki_backend: str | None = None
         wiki_model: str | None = None
+        wiki_baseline: Path | None = None
         _wiki_watch: Path | None = None
         i = 2
         while i < len(sys.argv):
@@ -5186,6 +5142,10 @@ def main() -> None:
                 wiki_out_format = sys.argv[i + 1]; i += 2
             elif sys.argv[i].startswith("--format="):
                 wiki_out_format = sys.argv[i].split("=", 1)[1]; i += 1
+            elif sys.argv[i] == "--baseline" and i + 1 < len(sys.argv):
+                wiki_baseline = Path(sys.argv[i + 1]); i += 2
+            elif sys.argv[i].startswith("--baseline="):
+                wiki_baseline = Path(sys.argv[i].split("=", 1)[1]); i += 1
             elif sys.argv[i] == "--backend" and i + 1 < len(sys.argv):
                 wiki_backend = sys.argv[i + 1]; i += 2
             elif sys.argv[i].startswith("--backend="):
@@ -5210,10 +5170,28 @@ def main() -> None:
         if not Path(_db_path).exists():
             print(f"error: no graph.db found at {_db_path} — run `graphify extract` first", file=sys.stderr)
             sys.exit(1)
+
+        # Load external wiki baseline if specified
+        _baseline_concepts: list[dict] | None = None
+        if wiki_baseline is not None:
+            if not wiki_baseline.exists():
+                print(f"error: baseline path not found: {wiki_baseline}", file=sys.stderr)
+                sys.exit(1)
+            from graphify.storage import parse_graph_json, parse_okf_bundle, _detect_format
+            _fmt = _detect_format(wiki_baseline)
+            if _fmt == "graph-json":
+                _baseline_concepts = parse_graph_json(wiki_baseline)
+            elif _fmt == "okf":
+                _baseline_concepts = parse_okf_bundle(wiki_baseline)
+            else:
+                print(f"error: cannot detect wiki format for {wiki_baseline}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Using external wiki baseline: {wiki_baseline} ({len(_baseline_concepts)} concepts)")
+
         _db, _conn = init_db(_db_path)
         ensure_schema(_conn, create_tables=False)
         try:
-            _result = analyze_wiki_impact(_conn)
+            _result = analyze_wiki_impact(_conn, baseline_concepts=_baseline_concepts)
         finally:
             close_db(_db, _conn)
 

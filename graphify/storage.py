@@ -832,6 +832,7 @@ def analyze_wiki_impact(
     conn: object,
     resolution: float = 1.0,
     *,
+    baseline_concepts: list[dict] | None = None,
     leiden_fn: callable | None = None,
 ) -> dict:
     """Run Leiden on current graph.db and compare with existing concepts.
@@ -841,6 +842,11 @@ def analyze_wiki_impact(
     previous clustering pass.
 
     If no concepts exist yet, all communities are reported as new.
+
+    baseline_concepts: optional list of concept dicts to use as baseline
+    instead of querying graph.db. Each dict should have 'id', 'name',
+    'members' (list of node IDs), and optionally 'links' (list of
+    target concept IDs). Used when comparing against an external wiki.
 
     leiden_fn: optional custom Leiden function for testing. Accepts
     (conn, resolution) and returns {community_id: [node_ids]}.
@@ -855,10 +861,20 @@ def analyze_wiki_impact(
             'summary': {'split': int, 'growth': int, ...},
         }
     """
-    # Step 1: Query existing concepts + members + links
-    old_concepts = _get_wiki_concepts(conn)
-    old_members = get_concept_members(conn)
-    old_links = _get_concept_links(conn)
+    # Step 1: Get baseline concepts (from parameter or graph.db)
+    if baseline_concepts is not None:
+        old_members: dict[str, list[str]] = {}
+        old_links: set[tuple[str, str]] = set()
+        for c in baseline_concepts:
+            cid = c.get("id", "")
+            if cid:
+                old_members[cid] = list(c.get("members", []))
+                for target in c.get("links", []):
+                    old_links.add((cid, target))
+    else:
+        _get_wiki_concepts(conn)
+        old_members = get_concept_members(conn)
+        old_links = _get_concept_links(conn)
 
     # Build node → concept_id lookup
     node_to_concept: dict[str, str] = {}
