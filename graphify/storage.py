@@ -1114,8 +1114,8 @@ def run_wiki_impact(
     finally:
         close_db(db, conn)
 
-    # Optional LLM naming for new concept candidates
-    if backend and result["new_concept_candidates"] and graph_json_path:
+    # Optional LLM naming for all concepts in the report
+    if backend and graph_json_path:
         gj = Path(graph_json_path)
         if gj.exists():
             try:
@@ -1123,17 +1123,64 @@ def run_wiki_impact(
                 from graphify.llm import label_communities, detect_backend as _detect_backend
                 raw_data = _json.loads(gj.read_text(encoding="utf-8"))
                 G = build_from_json(raw_data)
-                wiki_communities = {
-                    c["community_id"]: c["members"]
-                    for c in result["new_concept_candidates"]
-                }
                 actual_backend = backend or _detect_backend() or "gemini"
-                labels = label_communities(
-                    G, wiki_communities,
-                    backend=actual_backend, model=model,
-                )
-                for c in result["new_concept_candidates"]:
-                    c["name"] = labels.get(c["community_id"], f"Community {c['community_id']}")
+
+                # Collect all communities that need naming:
+                # 1. Changed old concepts (by their current/old members)
+                # 2. Split sub-communities
+                # 3. New concept candidates
+                # Use integer keys for label_communities compatibility
+                communities_to_name: dict[int, list[str]] = {}
+                key_to_origin: dict[int, str] = {}  # int key -> original id
+                next_key = 0
+
+                for cid, info in result["concept_changes"].items():
+                    if info["type"] in ("growth", "dissolved", "merge"):
+                        communities_to_name[next_key] = info.get("old_members", [])
+                        key_to_origin[next_key] = f"change:{cid}"
+                        next_key += 1
+                    elif info["type"] == "split":
+                        communities_to_name[next_key] = info.get("old_members", [])
+                        key_to_origin[next_key] = f"change:{cid}"
+                        next_key += 1
+                        # Also name split sub-communities
+                        for sub_cid, sub_members in info.get("split_into", {}).items():
+                            communities_to_name[next_key] = sub_members
+                            key_to_origin[next_key] = f"split:{cid}:{sub_cid}"
+                            next_key += 1
+
+                for c in result.get("new_concept_candidates", []):
+                    communities_to_name[next_key] = c["members"]
+                    key_to_origin[next_key] = f"new:{c['community_id']}"
+                    next_key += 1
+
+                if communities_to_name:
+                    labels = label_communities(
+                        G, communities_to_name,
+                        backend=actual_backend, model=model,
+                    )
+                    # Build reverse lookup: origin -> name
+                    origin_to_name: dict[str, str] = {}
+                    for k, origin in key_to_origin.items():
+                        if k in labels:
+                            origin_to_name[origin] = labels[k]
+
+                    # Apply names back
+                    for cid, info in result["concept_changes"].items():
+                        key = f"change:{cid}"
+                        if key in origin_to_name:
+                            info["name"] = origin_to_name[key]
+                        if info["type"] == "split":
+                            split_names = {}
+                            for sub_cid in info.get("split_into", {}):
+                                skey = f"split:{cid}:{sub_cid}"
+                                if skey in origin_to_name:
+                                    split_names[sub_cid] = origin_to_name[skey]
+                            if split_names:
+                                info["split_names"] = split_names
+                    for c in result.get("new_concept_candidates", []):
+                        nkey = f"new:{c['community_id']}"
+                        c["name"] = origin_to_name.get(nkey, f"Community {c['community_id']}")
             except Exception:
                 pass  # LLM naming is best-effort
 
@@ -1171,9 +1218,14 @@ def _format_wiki_impact_text(result: dict) -> str:
     if splits:
         lines.append(f"  --- split ({len(splits)}) ---")
         for cid, info in splits:
+            name = info.get('name', cid)
             old_n = len(info.get('old_members', []))
             into = info.get('split_into', {})
-            lines.append(f"    {cid} ({old_n} members) -> {len(into)} sub-communities")
+            split_names = info.get('split_names', {})
+            lines.append(f"    {name} ({old_n} members) -> {len(into)} sub-communities")
+            for sub_cid, sub_members in into.items():
+                sub_name = split_names.get(sub_cid, f"sub-{sub_cid}")
+                lines.append(f"      -> {sub_name} ({len(sub_members)} members)")
 
     # Growth details (top 10)
     growths = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "growth"]
@@ -1182,23 +1234,26 @@ def _format_wiki_impact_text(result: dict) -> str:
         show = growths[:10]
         lines.append(f"  --- growth (top {len(show)} of {len(growths)}) ---")
         for cid, info in show:
+            name = info.get('name', cid)
             old_n = len(info.get('old_members', []))
             new_n = len(info.get('new_members', []))
-            lines.append(f"    {cid}: {old_n} -> {new_n} members (+{new_n - old_n})")
+            lines.append(f"    {name}: {old_n} -> {new_n} members (+{new_n - old_n})")
 
     # Dissolved details
     dissolved = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "dissolved"]
     if dissolved:
         lines.append(f"  --- dissolved ({len(dissolved)}) ---")
         for cid, info in dissolved:
-            lines.append(f"    {cid} ({len(info.get('old_members', []))} members lost)")
+            name = info.get('name', cid)
+            lines.append(f"    {name} ({len(info.get('old_members', []))} members lost)")
 
     # Merge details
     merges = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "merge"]
     if merges:
         lines.append(f"  --- merge ({len(merges)}) ---")
         for cid, info in merges:
-            lines.append(f"    {cid} merged with {info.get('merged_with', [])}")
+            name = info.get('name', cid)
+            lines.append(f"    {name} merged with {info.get('merged_with', [])}")
 
     # New concept candidates
     candidates = result.get("new_concept_candidates", [])
