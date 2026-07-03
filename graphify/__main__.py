@@ -4807,14 +4807,13 @@ def main() -> None:
             )
             stages.mark("write")
             try:
-                from graphify.storage import init_db as _init_db, ensure_schema as _ensure_schema, ingest_extraction as _ingest, close_db as _close_db
-                _db_path = str(graphify_out / "graph.db")
-                _is_inc = Path(_db_path).exists()
-                _db, _conn = _init_db(_db_path)
-                _ensure_schema(_conn, create_tables=not _is_inc)
-                _ingest(_conn, merged, incremental=_is_inc,
-                        prune_sources=deleted_files or None, root=target)
-                _close_db(_db, _conn)
+                from graphify.storage import neug_sync as _neug_sync
+                _neug_sync(
+                    str(graphify_out / "graph.db"), merged,
+                    incremental=Path(str(graphify_out / "graph.db")).exists(),
+                    prune_sources=deleted_files or None, root=target,
+                    communities={},  # no-cluster: write extraction only, no concepts
+                )
                 print("[graphify extract] graph.db written (powered by NeuG)")
             except ImportError:
                 pass
@@ -4885,28 +4884,24 @@ def main() -> None:
             )
             sys.exit(1)
 
-        # Ingest extraction data to NeuG (persist for wiki-impact).
+        # Sync extraction data to NeuG graph.db (persist for wiki-impact).
         # Keep conn open so clustering can use NeuG Leiden directly.
         _neug_db = None
         _neug_conn = None
         try:
-            from graphify.storage import (
-                init_db as _init_db, ensure_schema as _ensure_schema,
-                ingest_extraction as _ingest, close_db as _close_db,
-            )
+            from graphify.storage import neug_sync as _neug_sync, close_db as _close_db
             _db_path = str(graphify_out / "graph.db")
-            _is_inc = Path(_db_path).exists()
-            _neug_db, _neug_conn = _init_db(_db_path)
-            _ensure_schema(_neug_conn, create_tables=not _is_inc)
-            _ingest(_neug_conn, merged, incremental=_is_inc,
-                    prune_sources=deleted_files or None, root=target)
+            _handle = _neug_sync(
+                _db_path, merged,
+                incremental=Path(_db_path).exists(),
+                prune_sources=deleted_files or None, root=target,
+            )
+            if _handle is not None:
+                _neug_db, _neug_conn = _handle
         except ImportError:
-            _neug_db = None
-            _neug_conn = None
+            pass
         except Exception as _exc:
             print(f"[graphify extract] warning: NeuG init failed: {_exc}", file=sys.stderr)
-            _neug_db = None
-            _neug_conn = None
 
         # Cluster — NeuG Leiden if graph.db available, else Python graspologic/networkx.
         communities = _cluster(G, conn=_neug_conn, resolution=cli_resolution,
@@ -4927,7 +4922,7 @@ def main() -> None:
         _backup(graphify_out)
         _to_json(G, communities, str(graph_json_path), force=True)
         stages.mark("export")
-        # Write clustering results (concepts) to graph.db
+        # Write clustering results (concepts) to graph.db and close.
         if _neug_conn is not None:
             try:
                 from graphify.storage import ingest_concepts as _ingest_concepts
@@ -5161,7 +5156,7 @@ def main() -> None:
         if _wiki_watch is None:
             _wiki_watch = Path(".")
         try:
-            from graphify.storage import init_db, ensure_schema, analyze_wiki_impact, close_db
+            from graphify.storage import run_wiki_impact as _run_wiki_impact
         except ImportError:
             print("error: neug is not installed. Run: pip install neug", file=sys.stderr)
             sys.exit(1)
@@ -5171,54 +5166,17 @@ def main() -> None:
             print(f"error: no graph.db found at {_db_path} — run `graphify extract` first", file=sys.stderr)
             sys.exit(1)
 
-        # Load external wiki baseline if specified
-        _baseline_concepts: list[dict] | None = None
-        if wiki_baseline is not None:
-            if not wiki_baseline.exists():
-                print(f"error: baseline path not found: {wiki_baseline}", file=sys.stderr)
-                sys.exit(1)
-            from graphify.storage import parse_graph_json, parse_okf_bundle, _detect_format
-            _fmt = _detect_format(wiki_baseline)
-            if _fmt == "graph-json":
-                _baseline_concepts = parse_graph_json(wiki_baseline)
-            elif _fmt == "okf":
-                _baseline_concepts = parse_okf_bundle(wiki_baseline)
-            else:
-                print(f"error: cannot detect wiki format for {wiki_baseline}", file=sys.stderr)
-                sys.exit(1)
-            print(f"Using external wiki baseline: {wiki_baseline} ({len(_baseline_concepts)} concepts)")
+        if wiki_baseline is not None and not wiki_baseline.exists():
+            print(f"error: baseline path not found: {wiki_baseline}", file=sys.stderr)
+            sys.exit(1)
 
-        _db, _conn = init_db(_db_path)
-        ensure_schema(_conn, create_tables=False)
-        try:
-            _result = analyze_wiki_impact(_conn, baseline_concepts=_baseline_concepts)
-        finally:
-            close_db(_db, _conn)
-
-        # Optional Layer 2: LLM naming for new concept candidates
-        if wiki_backend and _result["new_concept_candidates"]:
-            _graph_json = _graphify_out / "graph.json"
-            if _graph_json.exists():
-                try:
-                    from graphify.build import build_from_json as _build_from_json
-                    from graphify.llm import label_communities as _label_communities, detect_backend as _detect_backend_llm
-                    _raw_data = json.loads(_graph_json.read_text(encoding="utf-8"))
-                    _G_wiki = _build_from_json(_raw_data)
-                    _wiki_communities = {
-                        c["community_id"]: c["members"]
-                        for c in _result["new_concept_candidates"]
-                    }
-                    _actual_backend = wiki_backend or _detect_backend_llm() or "gemini"
-                    _labels = _label_communities(
-                        _G_wiki, _wiki_communities,
-                        backend=_actual_backend, model=wiki_model,
-                    )
-                    for c in _result["new_concept_candidates"]:
-                        c["name"] = _labels.get(c["community_id"], f"Community {c['community_id']}")
-                except Exception as _e:
-                    print(f"warning: LLM naming failed: {_e}", file=sys.stderr)
-            else:
-                print("warning: graph.json not found, skipping LLM naming", file=sys.stderr)
+        _result = _run_wiki_impact(
+            _db_path,
+            baseline_path=str(wiki_baseline) if wiki_baseline else None,
+            graph_json_path=str(_graphify_out / "graph.json"),
+            backend=wiki_backend,
+            model=wiki_model,
+        )
 
         if wiki_out_format == "json":
             _serializable = {

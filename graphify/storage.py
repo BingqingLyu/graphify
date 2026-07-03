@@ -1006,6 +1006,133 @@ def analyze_wiki_impact(
 
 
 # ---------------------------------------------------------------------------
+# High-level orchestration helpers (called by __main__.py)
+# ---------------------------------------------------------------------------
+
+
+def neug_sync(
+    db_path: str,
+    extraction: dict,
+    *,
+    incremental: bool = False,
+    prune_sources: list[str] | None = None,
+    root: object | None = None,
+    communities: dict[int, list[str]] | None = None,
+) -> tuple | None:
+    """Sync extraction data (and optionally communities) to graph.db.
+
+    Encapsulates all NeuG write operations for the extract pipeline:
+    1. Open/create graph.db
+    2. Ingest extraction (nodes + edges)
+    3. Optionally write communities as concepts
+    4. Close connection
+
+    Returns (db, conn) if caller needs the connection kept open (conn != None
+    means NeuG is available), or None if NeuG is not installed.
+
+    If communities is provided, also calls ingest_concepts and closes
+    the connection. If communities is None, returns (db, conn) open
+    for the caller to pass conn to cluster().
+    """
+    try:
+        db, conn = init_db(db_path)
+    except Exception:
+        return None
+
+    ensure_schema(conn, create_tables=not incremental)
+    ingest_extraction(conn, extraction, incremental=incremental,
+                      prune_sources=prune_sources, root=root)
+
+    if communities is not None:
+        try:
+            ingest_concepts(conn, [
+                {"id": f"concept_{cid}", "name": f"Community {cid}",
+                 "source": "leiden", "members": members}
+                for cid, members in communities.items()
+            ])
+        except Exception:
+            pass
+        close_db(db, conn)
+        return None
+
+    # Return open connection for caller (e.g. to pass to cluster)
+    return (db, conn)
+
+
+def run_wiki_impact(
+    db_path: str,
+    *,
+    baseline_path: str | None = None,
+    graph_json_path: str | None = None,
+    backend: str | None = None,
+    model: str | None = None,
+) -> dict:
+    """Run wiki-impact analysis end-to-end.
+
+    Encapsulates the full wiki-impact business logic:
+    1. Load baseline concepts (from external wiki or graph.db)
+    2. Open graph.db, run Leiden, compare
+    3. Optionally name new concepts via LLM
+    4. Return result dict
+
+    db_path: path to graph.db
+    baseline_path: optional external wiki path (auto-detect format)
+    graph_json_path: path to graph.json (for LLM naming context)
+    backend: LLM backend for naming new concepts (optional)
+    model: override LLM model
+    """
+    from pathlib import Path
+
+    # Load external baseline if specified
+    baseline_concepts: list[dict] | None = None
+    if baseline_path is not None:
+        p = Path(baseline_path)
+        if not p.exists():
+            raise FileNotFoundError(f"baseline path not found: {baseline_path}")
+        fmt = _detect_format(p)
+        if fmt == "graph-json":
+            baseline_concepts = parse_graph_json(p)
+        elif fmt == "okf":
+            baseline_concepts = parse_okf_bundle(p)
+        else:
+            raise ValueError(f"cannot detect wiki format for {baseline_path}")
+
+    # Run analysis
+    db, conn = init_db(db_path)
+    ensure_schema(conn, create_tables=False)
+    try:
+        result = analyze_wiki_impact(conn, baseline_concepts=baseline_concepts)
+    finally:
+        close_db(db, conn)
+
+    # Optional LLM naming for new concept candidates
+    if backend and result["new_concept_candidates"] and graph_json_path:
+        gj = Path(graph_json_path)
+        if gj.exists():
+            try:
+                import json as _json
+                from graphify.build import build_from_json
+                from graphify.llm import label_communities, detect_backend as _detect_backend
+                raw_data = _json.loads(gj.read_text(encoding="utf-8"))
+                G = build_from_json(raw_data)
+                wiki_communities = {
+                    c["community_id"]: c["members"]
+                    for c in result["new_concept_candidates"]
+                }
+                actual_backend = backend or _detect_backend() or "gemini"
+                labels = label_communities(
+                    G, wiki_communities,
+                    backend=actual_backend, model=model,
+                )
+                for c in result["new_concept_candidates"]:
+                    c["name"] = labels.get(c["community_id"], f"Community {c['community_id']}")
+            except Exception:
+                pass  # LLM naming is best-effort
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Wiki import — OKF + graph.json
 # ---------------------------------------------------------------------------
 
