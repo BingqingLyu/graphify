@@ -538,6 +538,12 @@ graphify install  # overwrites the skill file
 
 graphify cypher "MATCH (n) RETURN n LIMIT 10"         # query graph.db with Cypher (requires neug)
 graphify cypher "MATCH (n:code)-[e]->(m) RETURN n.id, e, m.id LIMIT 10" --db path/to/graph.db  # default: graphify-out/graph.db
+
+graphify wiki-impact .                                   # compare new Leiden communities vs existing concepts
+graphify wiki-impact . --min-concept-size 3              # filter out tiny concepts (< 3 members)
+graphify wiki-impact . --baseline ./wiki/                # use external wiki as baseline
+graphify wiki-impact . --backend ollama --model llama3.2 # LLM-name changed/new concepts
+graphify wiki-impact . --format json                     # structured JSON output
 /graphify ./raw --watch            # auto-sync as files change
 /graphify ./raw --mcp              # start MCP stdio server
 
