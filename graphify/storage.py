@@ -988,6 +988,7 @@ def run_wiki_impact(
     db_path: str,
     *,
     min_concept_size: int = 1,
+    resolution: float = 1.0,
     baseline_path: str | None = None,
     graph_json_path: str | None = None,
     backend: str | None = None,
@@ -998,6 +999,7 @@ def run_wiki_impact(
 
     db_path: path to graph.db
     min_concept_size: filter out concepts with fewer members (default 1)
+    resolution: Leiden resolution parameter (default 1.0, lower = larger communities)
     baseline_path: optional external wiki path (auto-detect format)
     graph_json_path: path to graph.json (for LLM naming context)
     backend: LLM backend for naming new concepts (optional)
@@ -1027,7 +1029,7 @@ def run_wiki_impact(
     db, conn = init_db(db_path)
     ensure_schema(conn, create_tables=False)
     try:
-        result = analyze_wiki_impact(conn, min_concept_size=min_concept_size, baseline_concepts=baseline_concepts)
+        result = analyze_wiki_impact(conn, resolution=resolution, min_concept_size=min_concept_size, baseline_concepts=baseline_concepts)
         # Get god nodes for LLM naming prioritization (same conn)
         gods = god_nodes_cypher(conn)
     finally:

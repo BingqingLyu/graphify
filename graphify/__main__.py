@@ -5146,6 +5146,7 @@ def main() -> None:
         wiki_model: str | None = None
         wiki_baseline: Path | None = None
         wiki_min_size: int = 3
+        wiki_resolution: float = 1.0
         _wiki_watch: Path | None = None
         i = 2
         while i < len(sys.argv):
@@ -5169,6 +5170,10 @@ def main() -> None:
                 wiki_model = sys.argv[i + 1]; i += 2
             elif sys.argv[i].startswith("--model="):
                 wiki_model = sys.argv[i].split("=", 1)[1]; i += 1
+            elif sys.argv[i] == "--resolution" and i + 1 < len(sys.argv):
+                wiki_resolution = float(sys.argv[i + 1]); i += 2
+            elif sys.argv[i].startswith("--resolution="):
+                wiki_resolution = float(sys.argv[i].split("=", 1)[1]); i += 1
             elif not sys.argv[i].startswith("--"):
                 _wiki_watch = Path(sys.argv[i]); i += 1
             else:
@@ -5193,6 +5198,7 @@ def main() -> None:
         _output = _run_wiki_impact(
             _db_path,
             min_concept_size=wiki_min_size,
+            resolution=wiki_resolution,
             baseline_path=str(wiki_baseline) if wiki_baseline else None,
             graph_json_path=str(_graphify_out / "graph.json"),
             backend=wiki_backend,
