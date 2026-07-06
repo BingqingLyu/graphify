@@ -575,7 +575,100 @@ def run_leiden(
     )
     return _leiden_on_projected(conn, 'graphify_full', resolution, concurrency)
 
+# ---------------------------------------------------------------------------
+# God nodes — most-connected real entities (Cypher equivalent of analyze.god_nodes)
+# ---------------------------------------------------------------------------
 
+# Labels that are builtin/mock noise — excluded from god-node ranking.
+# Must stay in sync with graphify/analyze.py:_BUILTIN_NOISE_LABELS.
+_GOD_NODE_NOISE_LABELS = frozenset({
+    "str", "int", "float", "bool", "bytes", "bytearray", "complex", "object",
+    "True", "False",
+    "MagicMock", "Mock", "AsyncMock", "NonCallableMock",
+    "NonCallableMagicMock", "PropertyMock", "patch", "sentinel",
+    "Path", "Any", "Optional", "List", "Dict", "Set", "Tuple", "Union",
+    "Callable", "Type", "ClassVar", "Final", "Literal", "Protocol",
+    "Counter", "defaultdict", "OrderedDict", "datetime", "Enum",
+    "os", "sys", "re", "json", "io", "abc", "typing",
+})
+
+# JSON key labels that are noise when source_file ends with .json.
+_GOD_NODE_JSON_NOISE = frozenset({
+    "start", "end", "name", "id", "type", "properties",
+    "value", "key", "data", "items", "title", "description", "version",
+    "dependencies", "devdependencies", "peerdependencies",
+    "optionaldependencies", "bundleddependencies", "bundledependencies",
+})
+
+
+def _is_file_node_row(label: str, source_file: str, degree: int) -> bool:
+    """Mirror analyze._is_file_node logic for a flat row."""
+    if not label:
+        return False
+    # File-level hub: label matches source filename
+    if source_file:
+        fname = source_file.rsplit("/", 1)[-1] if "/" in source_file else source_file
+        if label == fname:
+            return True
+    # Method stub: .method_name()
+    if label.startswith(".") and label.endswith("()"):
+        return True
+    # Isolated function stub: function_name() with degree <= 1
+    if label.endswith("()") and degree <= 1:
+        return True
+    return False
+
+
+def _is_concept_node_row(source_file: str) -> bool:
+    """Mirror analyze._is_concept_node logic for a flat row."""
+    if not source_file:
+        return True
+    # No extension in the last path segment → probably a concept label
+    last_seg = source_file.rsplit("/", 1)[-1] if "/" in source_file else source_file
+    if "." not in last_seg:
+        return True
+    return False
+
+
+def _is_json_key_node_row(label: str, source_file: str) -> bool:
+    """Mirror analyze._is_json_key_node logic for a flat row."""
+    if not source_file or not source_file.lower().endswith(".json"):
+        return False
+    return (label or "").strip().lower() in _GOD_NODE_JSON_NOISE
+
+
+def god_nodes_cypher(conn: object, top_n: int = 10) -> list[dict]:
+    """Return the top_n most-connected real entities from graph.db.
+
+    Mirrors graphify.analyze.god_nodes logic:
+    - Counts degree (in+out) for each node
+    - Excludes file-level hubs, concept nodes, JSON key noise, builtin noise
+    - Returns [{id, label, degree}] sorted by degree desc
+    """
+    # Query all nodes with their degree
+    rows = conn.execute(
+        "MATCH (n:node)-[e]-(m:node) "
+        "RETURN n.id, n.label, n.source_file, count(e) AS deg "
+        "ORDER BY deg DESC"
+    )
+
+    result: list[dict] = []
+    for row in rows:
+        nid, label, source_file, deg = row[0], row[1] or "", row[2] or "", row[3]
+        # Apply same filters as analyze.god_nodes
+        if _is_file_node_row(label, source_file, deg):
+            continue
+        if _is_concept_node_row(source_file):
+            continue
+        if _is_json_key_node_row(label, source_file):
+            continue
+        if label in _GOD_NODE_NOISE_LABELS:
+            continue
+        result.append({"id": nid, "label": label, "degree": deg})
+        if len(result) >= top_n:
+            break
+
+    return result
 
 
 
@@ -902,6 +995,8 @@ def run_wiki_impact(
     ensure_schema(conn, create_tables=False)
     try:
         result = analyze_wiki_impact(conn, min_concept_size=min_concept_size, baseline_concepts=baseline_concepts)
+        # Get god nodes for LLM naming prioritization (same conn)
+        gods = god_nodes_cypher(conn)
     finally:
         close_db(db, conn)
 
@@ -949,6 +1044,7 @@ def run_wiki_impact(
                     labels = label_communities(
                         G, communities_to_name,
                         backend=actual_backend, model=model,
+                        gods=gods,
                     )
                     # Build reverse lookup: origin -> name
                     origin_to_name: dict[str, str] = {}
