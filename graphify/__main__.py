@@ -3495,20 +3495,34 @@ def main() -> None:
         print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
         stages.mark("load")
 
-        print("Re-clustering...")
-        communities = cluster(G, resolution=co_resolution,
-                              exclude_hubs_percentile=co_exclude_hubs)
+        # --- Community source: NeuG graph.db (if available) or Python re-cluster ---
+        _graph_db_path = graph_json.parent / "graph.db"
+        _neug_communities = None
+        if _graph_db_path.exists():
+            try:
+                from graphify.storage import read_communities_from_db as _read_from_db
+                _neug_communities = _read_from_db(str(_graph_db_path))
+            except Exception as _exc:
+                print(f"[graphify] warning: could not read communities from graph.db: {_exc}", file=sys.stderr)
 
-        # Mirror the watch/update path (#822): map new cids to prior ones by
-        # node-overlap so the existing .graphify_labels.json keeps attaching
-        # to the same conceptual community after re-clustering.
-        previous_node_community = {
-            n["id"]: n["community"]
-            for n in _raw.get("nodes", [])
-            if n.get("community") is not None and n.get("id") is not None
-        }
-        if previous_node_community:
-            communities = remap_communities_to_previous(communities, previous_node_community)
+        if _neug_communities is not None:
+            communities = _neug_communities
+            print(f"Read {len(communities)} communities from graph.db (NeuG Leiden)")
+        else:
+            print("Re-clustering...")
+            communities = cluster(G, resolution=co_resolution,
+                                  exclude_hubs_percentile=co_exclude_hubs)
+
+            # Mirror the watch/update path (#822): map new cids to prior ones by
+            # node-overlap so the existing .graphify_labels.json keeps attaching
+            # to the same conceptual community after re-clustering.
+            previous_node_community = {
+                n["id"]: n["community"]
+                for n in _raw.get("nodes", [])
+                if n.get("community") is not None and n.get("id") is not None
+            }
+            if previous_node_community:
+                communities = remap_communities_to_previous(communities, previous_node_community)
         stages.mark("cluster")
 
         cohesion = score_all(G, communities)

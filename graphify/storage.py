@@ -512,6 +512,39 @@ def get_concept_members(conn: object) -> dict[str, list[str]]:
     return result
 
 
+def read_communities_from_db(db_path: str) -> dict[int, list[str]] | None:
+    """Read communities from graph.db and return in cluster() format.
+
+    Returns {int_community_id: [node_ids]} matching the format of
+    graphify.cluster.cluster(), or None if graph.db has no concepts.
+
+    Concept IDs in DB are stored as 'concept_{N}' — this function
+    strips the prefix to recover the integer key.
+    """
+    db, conn = init_db(db_path)
+    try:
+        ensure_schema(conn, create_tables=False)
+        raw = get_concept_members(conn)
+    finally:
+        close_db(db, conn)
+
+    if not raw:
+        return None
+
+    communities: dict[int, list[str]] = {}
+    for concept_id, node_ids in raw.items():
+        # concept_id format: "concept_0", "concept_1", ...
+        if concept_id.startswith("concept_"):
+            try:
+                cid = int(concept_id[len("concept_"):])
+            except ValueError:
+                continue
+        else:
+            continue
+        communities[cid] = node_ids
+    return communities if communities else None
+
+
 # ---------------------------------------------------------------------------
 # Leiden community detection (NeuG GDS)
 # ---------------------------------------------------------------------------
