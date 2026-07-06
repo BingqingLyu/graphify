@@ -1207,14 +1207,30 @@ def _format_wiki_impact_text(result: dict) -> str:
     # New concept candidates
     candidates = result.get("new_concept_candidates", [])
     if candidates:
+        # Sort by size descending, show top 15
+        candidates_sorted = sorted(candidates, key=lambda c: -len(c['members']))
+        # Omit thin communities (< 5 members) from display
+        significant = [c for c in candidates_sorted if len(c['members']) >= 5]
+        thin_count = len(candidates_sorted) - len(significant)
+        show = significant[:15]
         lines.append(f"  --- new concept candidates ({len(candidates)}) ---")
-        for c in candidates:
+        for c in show:
             name = c.get("name", f"Community {c['community_id']}")
             members = c['members']
-            preview = ', '.join(members[:5])
-            suffix = ", ..." if len(members) > 5 else ""
-            lines.append(f"    {name} ({len(members)} members, novelty: {c['novelty_ratio']})")
-            lines.append(f"      [{preview}{suffix}]")
+            n = len(members)
+            # Show first 8 node IDs, truncate the rest
+            preview_nodes = members[:8]
+            preview = ', '.join(preview_nodes)
+            suffix = f" (+{n - 8} more)" if n > 8 else ""
+            lines.append(f"    {name} ({n} members): {preview}{suffix}")
+        omitted = len(significant) - len(show)
+        if omitted > 0 or thin_count > 0:
+            parts = []
+            if omitted > 0:
+                parts.append(f"{omitted} more")
+            if thin_count > 0:
+                parts.append(f"{thin_count} thin communities omitted")
+            lines.append(f"    ({', '.join(parts)})")
 
     # Link changes
     lc = result.get("link_changes", {})
