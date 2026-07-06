@@ -704,14 +704,12 @@ def _build_server(graph_path: str):
 
     _neug_conn = None
     _neug_db = None
-    _neug_execute = None
     _neug_close_fn = None
     try:
         from graphify.storage import init_db as _neug_init, execute_cypher as _neug_exec, close_db as _neug_close
         _neug_db_path = str(Path(graph_path).parent / "graph.db")
         if Path(_neug_db_path).exists():
             _neug_db, _neug_conn = _neug_init(_neug_db_path)
-            _neug_execute = _neug_exec
             _neug_close_fn = _neug_close
     except ImportError:
         pass

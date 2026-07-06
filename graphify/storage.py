@@ -576,208 +576,7 @@ def run_leiden(
     return _leiden_on_projected(conn, 'graphify_full', resolution, concurrency)
 
 
-# ---------------------------------------------------------------------------
-# Incremental detection — temp graph + union Leiden
-# ---------------------------------------------------------------------------
 
-
-def load_temp_graph(
-    conn: object,
-    node_rows: list[dict],
-    edge_rows: list[dict],
-    *,
-    temp_node_label: str = "temp_node",
-    temp_edge_label: str = "temp_edge",
-) -> None:
-    """Load incremental data as temporary graph via COPY TEMP.
-
-    Temporary tables are auto-dropped when connection closes.
-    """
-    tmp_dir = tempfile.mkdtemp(prefix="graphify_temp_")
-    try:
-        if node_rows:
-            csv_path = os.path.join(tmp_dir, f"{temp_node_label}.csv")
-            _write_csv(csv_path, node_rows, _NODE_COLUMNS)
-            conn.execute(
-                f'COPY TEMP {temp_node_label} FROM "{csv_path}" (header=true, delim=",")'
-            )
-
-        if edge_rows:
-            csv_path = os.path.join(tmp_dir, f"{temp_edge_label}.csv")
-            _write_csv(csv_path, edge_rows, _EDGE_COLUMNS)
-            conn.execute(
-                f'COPY TEMP {temp_edge_label} FROM "{csv_path}" '
-                f'(header=true, delim=",", '
-                f'from="{temp_node_label}", to="{temp_node_label}")'
-            )
-    finally:
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def run_leiden_on_union(
-    conn: object,
-    affected_source_files: list[str],
-    *,
-    temp_node_label: str = "temp_node",
-    temp_edge_label: str = "temp_edge",
-    resolution: float = 1.0,
-    concurrency: int | None = None,
-) -> dict[int, list[str]]:
-    """Run Leiden on union of persistent + temporary graph.
-
-    Projects both persistent (node) and temporary (temp_node) tables
-    into a single projected graph without WHERE-based filtering.
-    NeuG's Cypher parser does not support string literals inside
-    project_graph predicate values, so we project all nodes and
-    let Leiden handle any duplicates naturally.
-    """
-    _ensure_gds(conn)
-
-    conn.execute(
-        f"CALL project_graph('union_graph', "
-        f"['node', '{temp_node_label}'], "
-        f"{{"
-        f"'[node, edge, node]': '', "
-        f"'[{temp_node_label}, {temp_edge_label}, {temp_node_label}]': '', "
-        f"'[node, edge, {temp_node_label}]': '', "
-        f"'[{temp_node_label}, {temp_edge_label}, node]': ''"
-        f"}}"
-    )
-
-    return _leiden_on_projected(conn, 'union_graph', resolution, concurrency)
-
-
-def detect_concept_delta(
-    conn: object,
-    delta_extraction: dict,
-    resolution: float = 1.0,
-    *,
-    mode: str = "temp",
-    leiden_fn: callable | None = None,
-) -> dict:
-    """Detect how incremental data affects existing concepts/communities.
-
-    mode="temp": load delta as COPY TEMP, analyze without modifying persistent data.
-    mode="persistent": ingest delta into graph.db, then re-run Leiden on full graph.
-
-    leiden_fn: optional custom Leiden function. If None, uses NeuG GDS Leiden.
-               For testing, pass a callable that accepts (conn, resolution) and
-               returns {community_id: [node_ids]}.
-
-    Returns:
-        {
-            'changes': {concept_id: {'type': str, ...}},
-            'new_communities': {cid: [node_ids]},
-            'summary': {'growth': int, 'merge': int, 'split': int, 'new': int, 'stable': int},
-        }
-    """
-    # Step 1: Load delta data
-    if mode == "temp":
-        node_rows, edge_rows, _ = _normalize_nodes(delta_extraction)
-        load_temp_graph(conn, node_rows, edge_rows)
-    elif mode == "persistent":
-        ingest_extraction(conn, delta_extraction, incremental=True)
-    else:
-        raise ValueError(f"Unknown mode: {mode!r}")
-
-    # Step 2: Query old concept membership
-    old_members = get_concept_members(conn)
-
-    # Build old_label: {node_id: concept_id}
-    old_label: dict[str, str] = {}
-    for cid, nids in old_members.items():
-        for nid in nids:
-            old_label[nid] = cid
-
-    # Step 3: Run new Leiden
-    affected_sfs = list({
-        n.get("source_file", "")
-        for n in (delta_extraction.get("nodes") or [])
-        if n.get("source_file")
-    })
-
-    if mode == "temp":
-        new_communities = run_leiden_on_union(
-            conn, affected_sfs, resolution=resolution,
-        )
-    else:
-        new_communities = run_leiden(conn, resolution=resolution)
-
-    # Build new_label: {node_id: community_id}
-    new_label: dict[int, str] = {}
-    for cid, nids in new_communities.items():
-        for nid in nids:
-            new_label[nid] = cid
-
-    # Step 4: Bidirectional change detection
-    changes: dict[str, dict] = {}
-
-    # Forward: each new community <- old sources
-    for new_cid, members in new_communities.items():
-        old_sources = {
-            old_label[n] for n in members
-            if n in old_label and old_label[n] is not None
-        }
-        has_new_nodes = any(n not in old_label for n in members)
-
-        if not old_sources:
-            changes[f"new_{new_cid}"] = {
-                "type": "new", "members": members,
-            }
-        elif len(old_sources) == 1:
-            old_cid = next(iter(old_sources))
-            if has_new_nodes or len(members) != len(old_members.get(old_cid, [])):
-                changes[old_cid] = {
-                    "type": "growth",
-                    "old_members": old_members.get(old_cid, []),
-                    "new_members": members,
-                }
-        elif len(old_sources) > 1:
-            merged_key = "+".join(sorted(old_sources))
-            changes[merged_key] = {
-                "type": "merge",
-                "merged_from": list(old_sources),
-                "new_members": members,
-            }
-
-    # Backward: each old community -> new targets
-    for old_cid, old_nodes in old_members.items():
-        new_targets = {
-            new_label[n] for n in old_nodes
-            if n in new_label and new_label[n] is not None
-        }
-        if len(new_targets) > 1:
-            if old_cid not in changes:
-                changes[old_cid] = {
-                    "type": "split",
-                    "old_members": old_nodes,
-                    "split_into": list(new_targets),
-                }
-
-    # Mark stable concepts
-    for old_cid in old_members:
-        if old_cid not in changes:
-            changes[old_cid] = {"type": "stable"}
-
-    # Step 5: Cleanup (temp mode)
-    if mode == "temp":
-        try:
-            conn.execute("DROP TABLE temp_edge")
-            conn.execute("DROP TABLE temp_node")
-        except RuntimeError:
-            pass
-
-    # Summary
-    summary = {"growth": 0, "merge": 0, "split": 0, "new": 0, "stable": 0}
-    for c in changes.values():
-        summary[c["type"]] = summary.get(c["type"], 0) + 1
-
-    return {
-        "changes": changes,
-        "new_communities": new_communities,
-        "summary": summary,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +633,6 @@ def analyze_wiki_impact(
     *,
     min_concept_size: int = 1,
     baseline_concepts: list[dict] | None = None,
-    leiden_fn: callable | None = None,
 ) -> dict:
     """Run Leiden on current graph.db and compare with existing concepts.
 
@@ -851,9 +649,6 @@ def analyze_wiki_impact(
     instead of querying graph.db. Each dict should have 'id', 'name',
     'members' (list of node IDs), and optionally 'links' (list of
     target concept IDs). Used when comparing against an external wiki.
-
-    leiden_fn: optional custom Leiden function for testing. Accepts
-    (conn, resolution) and returns {community_id: [node_ids]}.
 
     Returns::
 
@@ -876,7 +671,6 @@ def analyze_wiki_impact(
                 for target in c.get("links", []):
                     old_links.add((cid, target))
     else:
-        _get_wiki_concepts(conn)
         old_members = get_concept_members(conn)
         old_links = _get_concept_links(conn)
 
@@ -889,10 +683,7 @@ def analyze_wiki_impact(
             node_to_concept[nid] = cid
 
     # Step 2: Run Leiden on full graph
-    if leiden_fn is not None:
-        new_communities = leiden_fn(conn, resolution)
-    else:
-        new_communities = run_leiden(conn, resolution=resolution)
+    new_communities = run_leiden(conn, resolution=resolution)
 
     # Build node → new_community lookup
     node_to_new_comm: dict[str, int] = {}

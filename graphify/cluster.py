@@ -167,9 +167,10 @@ def postprocess_communities(
 
 def cluster(
     G: nx.Graph,
-    conn: object | None = None,
     resolution: float = 1.0,
     exclude_hubs_percentile: float | None = None,
+    *,
+    conn: object | None = None,
 ) -> dict[int, list[str]]:
     """Run Leiden community detection. Returns {community_id: [node_ids]}.
 

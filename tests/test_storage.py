@@ -165,7 +165,6 @@ def test_full_pipeline_with_mock_leiden(tmp_db):
     import networkx as nx
     from graphify.storage import (
         ingest_extraction, ingest_concepts, get_concept_members,
-        detect_concept_delta,
     )
     from graphify.cluster import cluster as run_leiden_fallback
 
@@ -204,10 +203,6 @@ def test_full_pipeline_with_mock_leiden(tmp_db):
     for members in members_by_concept.values():
         all_nodes.update(members)
     assert all_nodes == set(G.nodes())
-
-    # Note: detect_concept_delta requires NeuG GDS Leiden (v0.1.3+)
-    # which isn't available yet. The delta detection logic will be
-    # tested once GDS is available.
 
     _close(db, conn)
 
