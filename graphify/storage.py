@@ -845,13 +845,40 @@ def analyze_wiki_impact(
             else:
                 concept_changes[old_cid] = {"type": "stable"}
         else:
-            concept_changes[old_cid] = {
-                "type": "split",
-                "old_members": old_nodes,
-                "split_into": {
-                    str(cid): matched for cid, matched in new_targets.items()
-                },
+            # Filter sub-communities by min_concept_size
+            valid_subs = {
+                cid: matched for cid, matched in new_targets.items()
+                if len(matched) >= min_concept_size
             }
+
+            if len(valid_subs) >= 2:
+                # Genuine split: 2+ substantial sub-communities
+                concept_changes[old_cid] = {
+                    "type": "split",
+                    "old_members": old_nodes,
+                    "split_into": {
+                        str(cid): matched for cid, matched in valid_subs.items()
+                    },
+                }
+            elif len(valid_subs) == 1:
+                # One dominant sub-community — treat as growth/stable
+                dom_cid, dom_matched = next(iter(valid_subs.items()))
+                new_comm_members = new_communities.get(dom_cid, [])
+                has_growth = any(n not in old_nodes for n in new_comm_members)
+                if has_growth or len(dom_matched) != len(old_nodes):
+                    concept_changes[old_cid] = {
+                        "type": "growth",
+                        "old_members": old_nodes,
+                        "new_members": new_comm_members,
+                    }
+                else:
+                    concept_changes[old_cid] = {"type": "stable"}
+            else:
+                # No sub-community meets threshold — dissolved
+                concept_changes[old_cid] = {
+                    "type": "dissolved",
+                    "old_members": old_nodes,
+                }
 
     # Step 4: Detect new concept candidates
     # A community where >50% of nodes don't belong to any existing concept
