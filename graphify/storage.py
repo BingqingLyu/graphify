@@ -808,7 +808,33 @@ def analyze_wiki_impact(
         for nid in nids:
             node_to_concept[nid] = cid
 
-    # Step 2: Run Leiden on full graph (raw result, no Python postprocessing)
+    # Step 2: Check if graph structure changed since last extract.
+    # If all nodes in the graph are covered by existing concepts, no new
+    # data was ingested — skip Leiden to avoid non-determinism noise.
+    _all_concept_nodes: set[str] = set()
+    for _nids in old_members.values():
+        _all_concept_nodes.update(_nids)
+    try:
+        _node_count_rows = list(conn.execute("MATCH (n:node) RETURN count(n)"))
+        _graph_node_count = _node_count_rows[0][0] if _node_count_rows else 0
+    except RuntimeError:
+        _graph_node_count = -1  # can't determine, proceed with Leiden
+
+    if _graph_node_count > 0 and len(_all_concept_nodes) >= _graph_node_count and baseline_concepts is None:
+        # No new nodes since last extract — report all stable
+        return {
+            "concept_changes": {cid: {"type": "stable"} for cid in old_members},
+            "new_concept_candidates": [],
+            "link_changes": {"new_links": [], "stale_links": []},
+            "new_communities": {},
+            "summary": {
+                "split": 0, "growth": 0, "dissolved": 0,
+                "stable": len(old_members), "merge": 0,
+                "new": 0, "new_links": 0, "stale_links": 0,
+            },
+        }
+
+    # Step 3: Run Leiden on full graph (raw result, no Python postprocessing)
     new_communities = run_leiden(conn, resolution=resolution)
 
     # Re-index by size for stable comparison (same logic as cluster.py NeuG path)
