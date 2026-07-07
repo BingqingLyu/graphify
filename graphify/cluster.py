@@ -213,12 +213,15 @@ def cluster(
             from .storage import run_leiden
             neu_raw = run_leiden(conn, resolution=resolution)
             if neu_raw:
-                # NeuG Leiden runs on the full graph (including hubs).
-                # Extract hubs from results and reattach by majority vote
-                # so they don't skew community boundaries.
-                if hub_nodes:
-                    _extract_and_reattach_hubs(G, neu_raw, hub_nodes)
-                return postprocess_communities(G, neu_raw)
+                # NeuG Leiden is deterministic (fixed internal seed).
+                # Skip Python postprocess_communities to avoid non-determinism
+                # from _split_community / cohesion checks that depend on
+                # NetworkX graph state. Just re-index by size for stable IDs.
+                communities_sorted = sorted(
+                    neu_raw.values(),
+                    key=lambda nodes: (-len(nodes), tuple(sorted(map(str, nodes)))),
+                )
+                return {i: sorted(nodes) for i, nodes in enumerate(communities_sorted)}
         except Exception:
             pass  # Fall through to Python path
 

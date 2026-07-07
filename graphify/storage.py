@@ -808,8 +808,15 @@ def analyze_wiki_impact(
         for nid in nids:
             node_to_concept[nid] = cid
 
-    # Step 2: Run Leiden on full graph
+    # Step 2: Run Leiden on full graph (raw result, no Python postprocessing)
     new_communities = run_leiden(conn, resolution=resolution)
+
+    # Re-index by size for stable comparison (same logic as cluster.py NeuG path)
+    _sorted = sorted(
+        new_communities.values(),
+        key=lambda nodes: (-len(nodes), tuple(sorted(map(str, nodes)))),
+    )
+    new_communities = {i: sorted(nodes) for i, nodes in enumerate(_sorted)}
 
     # Build node → new_community lookup
     node_to_new_comm: dict[str, int] = {}
