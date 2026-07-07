@@ -853,6 +853,9 @@ def analyze_wiki_impact(
             node_to_new_comm[nid] = cid
 
     # Step 3: Detect concept changes (split / growth / dissolved / stable)
+    # Stability threshold: if 70%+ of a concept's members stay in the same
+    # new community, treat minor drift as Leiden noise, not a real split.
+    _STABILITY_THRESHOLD = 0.7
     concept_changes: dict[str, dict] = {}
 
     for old_cid, old_nodes in old_members.items():
@@ -867,11 +870,18 @@ def analyze_wiki_impact(
                 "type": "dissolved",
                 "old_members": old_nodes,
             }
-        elif len(new_targets) == 1:
-            new_cid, matched = next(iter(new_targets.items()))
-            new_comm_members = new_communities.get(new_cid, [])
-            has_growth = any(n not in old_nodes for n in new_comm_members)
-            if has_growth or len(matched) != len(old_nodes):
+            continue
+
+        # Find the dominant new community (where most members ended up)
+        dominant_cid = max(new_targets, key=lambda c: len(new_targets[c]))
+        dominant_count = len(new_targets[dominant_cid])
+        dominant_ratio = dominant_count / len(old_nodes) if old_nodes else 0
+
+        if dominant_ratio >= _STABILITY_THRESHOLD:
+            # Most members stayed together — this is stable or growth, not split
+            new_comm_members = new_communities.get(dominant_cid, [])
+            new_in_comm = [n for n in new_comm_members if n not in old_nodes]
+            if new_in_comm or dominant_count != len(old_nodes):
                 concept_changes[old_cid] = {
                     "type": "growth",
                     "old_members": old_nodes,
@@ -880,14 +890,13 @@ def analyze_wiki_impact(
             else:
                 concept_changes[old_cid] = {"type": "stable"}
         else:
-            # Filter sub-communities by min_concept_size
+            # Members genuinely scattered — check for real split
             valid_subs = {
                 cid: matched for cid, matched in new_targets.items()
                 if len(matched) >= min_concept_size
             }
 
             if len(valid_subs) >= 2:
-                # Genuine split: 2+ substantial sub-communities
                 concept_changes[old_cid] = {
                     "type": "split",
                     "old_members": old_nodes,
@@ -896,7 +905,6 @@ def analyze_wiki_impact(
                     },
                 }
             elif len(valid_subs) == 1:
-                # One dominant sub-community — treat as growth/stable
                 dom_cid, dom_matched = next(iter(valid_subs.items()))
                 new_comm_members = new_communities.get(dom_cid, [])
                 has_growth = any(n not in old_nodes for n in new_comm_members)
@@ -909,7 +917,6 @@ def analyze_wiki_impact(
                 else:
                     concept_changes[old_cid] = {"type": "stable"}
             else:
-                # No sub-community meets threshold — dissolved
                 concept_changes[old_cid] = {
                     "type": "dissolved",
                     "old_members": old_nodes,
@@ -1165,8 +1172,9 @@ def run_wiki_impact(
                     for c in result.get("new_concept_candidates", []):
                         nkey = f"new:{c['community_id']}"
                         c["name"] = origin_to_name.get(nkey, f"Community {c['community_id']}")
-            except Exception:
-                pass  # LLM naming is best-effort
+            except Exception as _naming_exc:
+                import sys as _sys
+                print(f"[wiki-impact] LLM naming failed: {_naming_exc}", file=_sys.stderr)
 
     # Format output
     if output_format == "json":
