@@ -853,9 +853,11 @@ def analyze_wiki_impact(
             node_to_new_comm[nid] = cid
 
     # Step 3: Detect concept changes (split / growth / dissolved / stable)
-    # Stability threshold: if 70%+ of a concept's members stay in the same
-    # new community, treat minor drift as Leiden noise, not a real split.
-    _STABILITY_THRESHOLD = 0.7
+    # Stability threshold: if 50%+ of a concept's members stay in the same
+    # new community, treat drift as Leiden noise, not a real split.
+    # Growth threshold: only report growth if the community grew by >20%.
+    _STABILITY_THRESHOLD = 0.5
+    _GROWTH_MIN_RATIO = 0.2  # at least 20% new members to count as growth
     concept_changes: dict[str, dict] = {}
 
     for old_cid, old_nodes in old_members.items():
@@ -881,7 +883,8 @@ def analyze_wiki_impact(
             # Most members stayed together — this is stable or growth, not split
             new_comm_members = new_communities.get(dominant_cid, [])
             new_in_comm = [n for n in new_comm_members if n not in old_nodes]
-            if new_in_comm or dominant_count != len(old_nodes):
+            growth_ratio = len(new_in_comm) / len(old_nodes) if old_nodes else 0
+            if new_in_comm and growth_ratio >= _GROWTH_MIN_RATIO:
                 concept_changes[old_cid] = {
                     "type": "growth",
                     "old_members": old_nodes,
@@ -1277,17 +1280,25 @@ def _format_wiki_impact_text(result: dict) -> str:
 
     # Link changes
     lc = result.get("link_changes", {})
+    # Build concept name lookup for link display
+    _cid_names: dict[str, str] = {}
+    for cid, info in result["concept_changes"].items():
+        _cid_names[cid] = info.get('name', cid)
     new_links = lc.get("new_links", [])
     if new_links:
         lines.append(f"  --- new links ({len(new_links)}, showing top 10) ---")
         nl_sorted = sorted(new_links, key=lambda x: -x['co_occurrence'])
         for link in nl_sorted[:10]:
-            lines.append(f"    {link['from']} -> {link['to']} (co-occurrence: {link['co_occurrence']})")
+            from_name = _cid_names.get(link['from'], link['from'])
+            to_name = _cid_names.get(link['to'], link['to'])
+            lines.append(f"    {from_name} -> {to_name} (co-occurrence: {link['co_occurrence']})")
     stale_links = lc.get("stale_links", [])
     if stale_links:
         lines.append(f"  --- stale links ({len(stale_links)}) ---")
         for link in stale_links[:10]:
-            lines.append(f"    {link['from']} -> {link['to']}")
+            from_name = _cid_names.get(link['from'], link['from'])
+            to_name = _cid_names.get(link['to'], link['to'])
+            lines.append(f"    {from_name} -> {to_name}")
 
     return "\n".join(lines)
 
