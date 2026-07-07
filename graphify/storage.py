@@ -800,6 +800,11 @@ def analyze_wiki_impact(
         old_members = get_concept_members(conn)
         old_links = _get_concept_links(conn)
 
+    # Build full node set BEFORE min_concept_size filtering (for change detection)
+    _all_concept_nodes: set[str] = set()
+    for _nids in old_members.values():
+        _all_concept_nodes.update(_nids)
+
     # Build node → concept_id lookup (after filtering by min_concept_size)
     if min_concept_size > 1:
         old_members = {cid: nids for cid, nids in old_members.items() if len(nids) >= min_concept_size}
@@ -811,9 +816,6 @@ def analyze_wiki_impact(
     # Step 2: Check if graph structure changed since last extract.
     # If all nodes in the graph are covered by existing concepts, no new
     # data was ingested — skip Leiden to avoid non-determinism noise.
-    _all_concept_nodes: set[str] = set()
-    for _nids in old_members.values():
-        _all_concept_nodes.update(_nids)
     try:
         _node_count_rows = list(conn.execute("MATCH (n:node) RETURN count(n)"))
         _graph_node_count = _node_count_rows[0][0] if _node_count_rows else 0
