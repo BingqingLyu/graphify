@@ -542,6 +542,75 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     return True
 
 
+def to_json_from_extraction(
+    merged: dict,
+    communities: dict[int, list[str]],
+    output_path: str,
+    *,
+    force: bool = True,
+    built_at_commit: str | None = None,
+    community_labels: dict[int, str] | None = None,
+) -> bool:
+    """Write graph.json directly from a merged extraction + communities WITHOUT
+    building a NetworkX graph.
+
+    Output matches ``to_json``'s node-link format (nodes/links, ``directed`` =
+    False like ``build()``'s default) so every downstream reader
+    (build_from_json / cluster-only / serve / reflect) keeps working unchanged.
+    Used by the NeuG extract path to avoid holding a full in-memory graph, the
+    source of large-repo OOM/segfault.
+    """
+    from graphify.build import dedupe_nodes, dedupe_edges
+
+    nodes = dedupe_nodes(list(merged.get("nodes", [])))
+    edges = dedupe_edges(list(merged.get("edges", [])))
+    node_community = _node_community_map(communities or {})
+    _labels: dict[int, str] = {int(k): v for k, v in (community_labels or {}).items()}
+    node_sf = {n.get("id"): n.get("source_file") for n in nodes}
+
+    out_nodes: list[dict] = []
+    for n in nodes:
+        d = dict(n)
+        nid = d.get("id")
+        cid = node_community.get(nid) if nid is not None else None
+        d["community"] = cid
+        if cid is not None and _labels:
+            d["community_name"] = _labels.get(cid, f"Community {cid}")
+        d["norm_label"] = _strip_diacritics(d.get("label", "")).lower()
+        out_nodes.append(d)
+
+    out_links: list[dict] = []
+    for e in edges:
+        d = dict(e)
+        src = d.get("source", d.get("from"))
+        tgt = d.get("target", d.get("to"))
+        d.pop("from", None)
+        d.pop("to", None)
+        d["source"] = src
+        d["target"] = tgt
+        if "confidence_score" not in d:
+            conf = d.get("confidence", "EXTRACTED")
+            d["confidence_score"] = _CONFIDENCE_SCORE_DEFAULTS.get(conf, 1.0)
+        if not d.get("source_file"):
+            d["source_file"] = node_sf.get(src) or node_sf.get(tgt) or ""
+        out_links.append(d)
+
+    data: dict = {
+        "directed": False,
+        "multigraph": False,
+        "graph": {},
+        "nodes": out_nodes,
+        "links": out_links,
+        "hyperedges": merged.get("hyperedges", []),
+    }
+    commit = built_at_commit if built_at_commit is not None else _git_head()
+    if commit:
+        data["built_at_commit"] = commit
+    with open(output_path, "w", encoding="utf-8") as f:  # nosec
+        json.dump(data, f, indent=2)
+    return True
+
+
 def prune_dangling_edges(graph_data: dict) -> tuple[dict, int]:
     """Remove edges whose source or target node is not in the node set.
 

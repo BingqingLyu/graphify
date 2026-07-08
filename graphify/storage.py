@@ -82,12 +82,18 @@ def _write_csv(path: str, rows: list[dict], columns: list[str]) -> int:
 
 
 def _copy_csv(conn: object, csv_path: str, table: str, *,
+               columns: list[str] | None = None,
                from_table: str | None = None,
                to_table: str | None = None) -> None:
     """COPY FROM for node or relationship tables.
 
     When from_table/to_table are None, performs a node COPY.
     Otherwise performs a relationship COPY with endpoint references.
+
+    columns: explicit column list for a node COPY. Needed once the node table
+    gains columns beyond the CSV (e.g. leiden_comm added by Leiden warm-start):
+    without it NeuG sniffs the CSV column count against the table and raises a
+    schema mismatch. Missing columns fall back to their DEFAULT.
     """
     if from_table and to_table:
         conn.execute(
@@ -96,8 +102,9 @@ def _copy_csv(conn: object, csv_path: str, table: str, *,
             f'header=true, delim=",", escaping=false)'
         )
     else:
+        col_clause = f' ({", ".join(columns)})' if columns else ""
         conn.execute(
-            f'COPY {table} FROM "{csv_path}" (header=true, delim=",", escaping=false)'
+            f'COPY {table}{col_clause} FROM "{csv_path}" (header=true, delim=",", escaping=false)'
         )
 
 
@@ -794,6 +801,142 @@ def god_nodes_cypher(conn: object, top_n: int = 10) -> list[dict]:
             break
 
     return result
+
+
+def cohesion_cypher(conn: object, communities: dict[int, list[str]]) -> dict[int, float]:
+    """Cohesion per community from graph.db (NeuG equivalent of
+    cluster.score_all): intra-community undirected edge count / max possible.
+
+    Reads all node-node edges once and tallies in Python, avoiding per-community
+    parameterized IN queries. Directed duplicates (a->b, b->a) collapse to one
+    undirected edge to match cluster.cohesion_score's undirected subgraph count.
+    """
+    node_comm: dict[str, int] = {n: cid for cid, nodes in communities.items() for n in nodes}
+    intra: dict[int, set] = {cid: set() for cid in communities}
+    try:
+        for row in conn.execute("MATCH (a:node)-[e:edge]->(b:node) RETURN a.id, b.id"):
+            a, b = row[0], row[1]
+            if a == b:
+                continue
+            ca = node_comm.get(a)
+            if ca is not None and ca == node_comm.get(b):
+                intra[ca].add(frozenset((a, b)))
+    except RuntimeError:
+        pass
+    result: dict[int, float] = {}
+    for cid, nodes in communities.items():
+        n = len(nodes)
+        if n <= 1:
+            result[cid] = 1.0
+            continue
+        possible = n * (n - 1) / 2
+        result[cid] = (len(intra.get(cid, ())) / possible) if possible > 0 else 0.0
+    return result
+
+
+def surprising_connections_cypher(
+    conn: object,
+    communities: dict[int, list[str]] | None = None,
+    top_n: int = 5,
+) -> list[dict]:
+    """NeuG equivalent of analyze._cross_file_surprises: cross-file edges between
+    real entities ranked by a composite surprise score, read from graph.db
+    (no NetworkX graph). Reuses analyze's pure helpers (_file_category /
+    _top_level_dir / _cross_language) and storage row filters; the scoring is a
+    dict-backed copy of analyze._surprise_score so the original stays untouched.
+
+    Only the multi-source cross-file path is implemented (the dominant extract
+    case). The single-source betweenness fallback is omitted (returns []).
+    """
+    from .analyze import _file_category, _top_level_dir, _cross_language
+
+    communities = communities or {}
+    node_community: dict[str, int] = {n: cid for cid, nodes in communities.items() for n in nodes}
+
+    labels: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    try:
+        for row in conn.execute("MATCH (n:node) RETURN n.id, n.label, n.source_file"):
+            labels[row[0]] = row[1] or row[0]
+            sources[row[0]] = row[2] or ""
+    except RuntimeError:
+        return []
+
+    edges: list[tuple] = []
+    degrees: dict[str, int] = {}
+    try:
+        for row in conn.execute(
+            "MATCH (a:node)-[e:edge]->(b:node) RETURN a.id, b.id, e.relation, e.confidence"
+        ):
+            a, b = row[0], row[1]
+            edges.append((a, b, row[2] or "", row[3] or "EXTRACTED"))
+            degrees[a] = degrees.get(a, 0) + 1
+            degrees[b] = degrees.get(b, 0) + 1
+    except RuntimeError:
+        return []
+
+    def _score(u, v, relation, conf, u_source, v_source):
+        # Dict-backed mirror of analyze._surprise_score (original untouched).
+        score = 0
+        reasons: list[str] = []
+        conf_bonus = {"AMBIGUOUS": 3, "INFERRED": 2, "EXTRACTED": 1}.get(conf, 1)
+        cat_u, cat_v = _file_category(u_source), _file_category(v_source)
+        suppress = (
+            conf == "INFERRED" and relation in ("calls", "uses")
+            and (_cross_language(u_source, v_source) or {cat_u, cat_v} == {"code", "doc"})
+        )
+        if suppress:
+            conf_bonus = 0
+        score += conf_bonus
+        if conf in ("AMBIGUOUS", "INFERRED"):
+            reasons.append(f"{conf.lower()} connection - not explicitly stated in source")
+        if cat_u != cat_v and not suppress:
+            score += 2
+            reasons.append(f"crosses file types ({cat_u} \u2194 {cat_v})")
+        if _top_level_dir(u_source) != _top_level_dir(v_source) and not suppress:
+            score += 2
+            reasons.append("connects across different repos/directories")
+        cu, cv = node_community.get(u), node_community.get(v)
+        if cu is not None and cv is not None and cu != cv and not suppress:
+            score += 1
+            reasons.append("bridges separate communities")
+        if relation == "semantically_similar_to":
+            score = int(score * 1.5)
+            reasons.append("semantically similar concepts with no structural link")
+        du, dv = degrees.get(u, 0), degrees.get(v, 0)
+        if min(du, dv) <= 2 and max(du, dv) >= 5:
+            score += 1
+            peripheral = labels.get(u, u) if du <= 2 else labels.get(v, v)
+            hub = labels.get(v, v) if du <= 2 else labels.get(u, u)
+            reasons.append(f"peripheral node `{peripheral}` unexpectedly reaches hub `{hub}`")
+        return score, reasons
+
+    candidates: list[dict] = []
+    for a, b, relation, conf in edges:
+        if relation in ("imports", "imports_from", "contains", "method"):
+            continue
+        la, sa, da = labels.get(a, a), sources.get(a, ""), degrees.get(a, 0)
+        lb, sb, db_ = labels.get(b, b), sources.get(b, ""), degrees.get(b, 0)
+        if _is_concept_node_row(sa) or _is_concept_node_row(sb):
+            continue
+        if _is_file_node_row(la, sa, da) or _is_file_node_row(lb, sb, db_):
+            continue
+        if not sa or not sb or sa == sb:
+            continue
+        score, reasons = _score(a, b, relation, conf, sa, sb)
+        candidates.append({
+            "_score": score,
+            "source": la,
+            "target": lb,
+            "source_files": [sa, sb],
+            "confidence": conf,
+            "relation": relation,
+            "why": "; ".join(reasons) if reasons else "cross-file semantic connection",
+        })
+    candidates.sort(key=lambda x: x["_score"], reverse=True)
+    for c in candidates:
+        c.pop("_score")
+    return candidates[:top_n]
 
 
 

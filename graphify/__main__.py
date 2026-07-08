@@ -4295,6 +4295,7 @@ def main() -> None:
         cli_postgres_dsn: str | None = None
         cli_cargo: bool = False
         no_cluster = False
+        dump_csv = False
         dedup_llm = False
         google_workspace = False
         global_merge = False
@@ -4354,6 +4355,8 @@ def main() -> None:
                 out_dir = Path(a.split("=", 1)[1]); i += 1
             elif a == "--no-cluster":
                 no_cluster = True; i += 1
+            elif a == "--dump-csv":
+                dump_csv = True; i += 1
             elif a == "--dedup-llm":
                 dedup_llm = True; i += 1
             elif a == "--google-workspace":
@@ -4776,6 +4779,41 @@ def main() -> None:
             for ftype, flist in files_by_type.items()
         }
 
+        # --dump-csv: export raw merged nodes/edges to CSV for standalone verification
+        if dump_csv:
+            import csv as _csv
+            _dump_nodes_path = graphify_out / "dump_nodes.csv"
+            _dump_edges_path = graphify_out / "dump_edges.csv"
+            with open(_dump_nodes_path, "w", newline="", encoding="utf-8") as _f:
+                _w = _csv.DictWriter(_f, fieldnames=["id", "label", "type", "source_file", "source_location"],
+                                     extrasaction="ignore", quoting=_csv.QUOTE_ALL)
+                _w.writeheader()
+                for _n in merged["nodes"]:
+                    _w.writerow({
+                        "id": _n.get("id", ""),
+                        "label": _n.get("label", ""),
+                        "type": _n.get("type", _n.get("file_type", "")),
+                        "source_file": _n.get("source_file", ""),
+                        "source_location": _n.get("source_location", ""),
+                    })
+            with open(_dump_edges_path, "w", newline="", encoding="utf-8") as _f:
+                _w = _csv.DictWriter(_f, fieldnames=["from_id", "to_id", "relation", "confidence",
+                                                     "confidence_score", "source_file", "weight"],
+                                     extrasaction="ignore", quoting=_csv.QUOTE_ALL)
+                _w.writeheader()
+                for _e in merged["edges"]:
+                    _w.writerow({
+                        "from_id": _e.get("source", _e.get("from", "")),
+                        "to_id": _e.get("target", _e.get("to", "")),
+                        "relation": _e.get("relation", ""),
+                        "confidence": _e.get("confidence", ""),
+                        "confidence_score": str(_e.get("confidence_score", 0.0)),
+                        "source_file": _e.get("source_file", ""),
+                        "weight": str(_e.get("weight", 1.0)),
+                    })
+            print(f"[graphify extract] --dump-csv: wrote {_dump_nodes_path} ({len(merged['nodes'])} nodes)")
+            print(f"[graphify extract] --dump-csv: wrote {_dump_edges_path} ({len(merged['edges'])} edges)")
+
         if no_cluster:
             # --no-cluster: dump the raw merged extraction as graph.json.
             # No NetworkX, no community detection, no analysis sidecar.
@@ -4867,6 +4905,51 @@ def main() -> None:
                     print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
             stages.total()
             sys.exit(0)
+
+        # NeuG-optimized path: when neug is importable, run the whole
+        # full/incremental extract against graph.db WITHOUT building a NetworkX
+        # graph (avoids the large-repo memory-peak OOM/segfault). This is kept
+        # entirely separate from the original pipeline below, which is preserved
+        # verbatim as the fallback when neug is missing or the neug path fails.
+        _neug_available = False
+        try:
+            import neug as _neug  # noqa: F401
+            _neug_available = True
+        except ImportError:
+            pass
+        if _neug_available:
+            try:
+                from graphify.neug_extract import neug_extract as _neug_extract
+                _neug_extract(
+                    merged,
+                    graphify_out=graphify_out,
+                    target=target,
+                    graph_json_path=graph_json_path,
+                    analysis_path=analysis_path,
+                    manifest_path=manifest_path,
+                    manifest_files=_manifest_files,
+                    incremental_mode=incremental_mode,
+                    deleted_files=deleted_files,
+                    resolution=cli_resolution,
+                    backend=backend,
+                    global_merge=global_merge,
+                    global_repo_tag=global_repo_tag,
+                    sem_cache_hits=sem_cache_hits,
+                    sem_cache_misses=sem_cache_misses,
+                    unchanged_total=unchanged_total,
+                    code_files=code_files,
+                    stages=stages,
+                )
+                stages.total()
+                sys.exit(0)
+            except SystemExit:
+                raise
+            except Exception as _neug_exc:
+                print(
+                    f"[graphify extract] NeuG path failed ({_neug_exc}); "
+                    "falling back to NetworkX pipeline.",
+                    file=sys.stderr,
+                )
 
         # Build graph + cluster + score + write.
         from graphify.build import (
