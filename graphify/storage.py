@@ -90,10 +90,9 @@ def _copy_csv(conn: object, csv_path: str, table: str, *,
     When from_table/to_table are None, performs a node COPY.
     Otherwise performs a relationship COPY with endpoint references.
 
-    columns: explicit column list for a node COPY. Needed once the node table
-    gains columns beyond the CSV (e.g. leiden_comm added by Leiden warm-start):
-    without it NeuG sniffs the CSV column count against the table and raises a
-    schema mismatch. Missing columns fall back to their DEFAULT.
+    columns: optional explicit column list for a node COPY. Some NeuG versions
+    still validate the CSV's physical column count against the full table width,
+    so callers must ensure the CSV includes any ALTER-added columns.
     """
     if from_table and to_table:
         conn.execute(
@@ -166,6 +165,15 @@ def _normalize_nodes(
     return node_rows, edge_rows, node_types
 
 
+def _node_table_has_leiden_comm(conn: object) -> bool:
+    """Return True when the node table has the Leiden warm-start column."""
+    try:
+        list(conn.execute("MATCH (n:node) RETURN n.leiden_comm LIMIT 1"))  # type: ignore[attr-defined]
+        return True
+    except RuntimeError:
+        return False
+
+
 def _bulk_load(
     conn: object,
     tmpdir: str,
@@ -182,8 +190,13 @@ def _bulk_load(
     """Write CSVs and COPY FROM in one shot. Shared by bulk/incremental/concepts."""
     if node_rows:
         csv_path = os.path.join(tmpdir, f"{node_table}.csv")
-        _write_csv(csv_path, node_rows, node_columns)
-        _copy_csv(conn, csv_path, node_table)
+        write_node_columns = list(node_columns)
+        write_node_rows = node_rows
+        if node_table == "node" and "leiden_comm" not in write_node_columns and _node_table_has_leiden_comm(conn):
+            write_node_columns.append("leiden_comm")
+            write_node_rows = [{**row, "leiden_comm": row.get("leiden_comm", -1)} for row in node_rows]
+        _write_csv(csv_path, write_node_rows, write_node_columns)
+        _copy_csv(conn, csv_path, node_table, columns=write_node_columns)
 
     if edge_rows:
         csv_path = os.path.join(tmpdir, f"{edge_table}.csv")

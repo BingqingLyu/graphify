@@ -87,6 +87,22 @@ def test_ingest_extraction_merge_mode(tmp_db):
     _close(db, conn)
 
 
+def test_ingest_extraction_incremental_after_leiden_column(tmp_db):
+    from graphify.storage import ingest_extraction, _ensure_leiden_comm_column
+    db, conn = _init(tmp_db)
+    ext = _load_extraction()
+    ingest_extraction(conn, ext, incremental=False)
+    _ensure_leiden_comm_column(conn)
+    ext["nodes"][0]["label"] = "TransformerV2"
+    ingest_extraction(conn, ext, incremental=True)
+    rows = _query(
+        conn,
+        "MATCH (n:node) WHERE n.id = 'n_transformer' RETURN n.label, n.leiden_comm",
+    )
+    assert rows[0] == ["TransformerV2", -1]
+    _close(db, conn)
+
+
 # --- file_type routing ---
 
 def test_ingest_extraction_file_type_routing(tmp_db):
