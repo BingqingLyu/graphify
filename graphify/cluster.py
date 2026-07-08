@@ -171,6 +171,7 @@ def cluster(
     exclude_hubs_percentile: float | None = None,
     *,
     conn: object | None = None,
+    incremental: bool = False,
 ) -> dict[int, list[str]]:
     """Run Leiden community detection. Returns {community_id: [node_ids]}.
 
@@ -190,6 +191,9 @@ def cluster(
         percentile are excluded from partitioning and reattached to their
         majority-vote neighbour community afterwards. Useful for staging/utility
         super-hubs that inflate god-node rankings (#919).
+    incremental: when True and conn is provided, uses NeuG's
+        initial_community_property warm-start to preserve community stability
+        across incremental builds.
     """
     if G.number_of_nodes() == 0:
         return {}
@@ -211,7 +215,7 @@ def cluster(
     if conn is not None:
         try:
             from .storage import run_leiden
-            neu_raw = run_leiden(conn, resolution=resolution)
+            neu_raw = run_leiden(conn, resolution=resolution, incremental=incremental)
             if neu_raw:
                 # NeuG Leiden is deterministic (fixed internal seed).
                 # Skip Python postprocess_communities to avoid non-determinism

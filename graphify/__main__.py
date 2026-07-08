@@ -4920,7 +4920,8 @@ def main() -> None:
 
         # Cluster — NeuG Leiden if graph.db available, else Python graspologic/networkx.
         communities = _cluster(G, conn=_neug_conn, resolution=cli_resolution,
-                               exclude_hubs_percentile=cli_exclude_hubs)
+                               exclude_hubs_percentile=cli_exclude_hubs,
+                               incremental=incremental_mode)
         stages.mark("cluster")
         cohesion = _score_all(G, communities)
         try:

@@ -2147,10 +2147,14 @@ def _placeholder_community_labels(communities) -> dict[int, str]:
     return {int(cid): f"Community {cid}" for cid in communities}
 
 
-def _community_label_lines(G, communities, gods, max_communities, top_k):
+def _community_label_lines(G, communities, gods, max_communities, top_k, conn=None):
     """One prompt line per community (largest first), sampling up to ``top_k``
     representative node labels (god nodes first). Returns (lines, labeled_cids);
-    skips communities with no resolvable nodes."""
+    skips communities with no resolvable nodes.
+
+    conn: optional NeuG connection. When provided, node labels are queried
+    per-node from graph.db (like G.nodes[nid] but backed by the DB).
+    """
     # gods may be node-id strings or god_nodes() dicts ({"id": ..., "label": ...}).
     god_set = {g["id"] if isinstance(g, dict) else g for g in (gods or [])}
     ordered = sorted(communities.items(), key=lambda kv: -len(kv[1]))
@@ -2161,7 +2165,19 @@ def _community_label_lines(G, communities, gods, max_communities, top_k):
         names: list[str] = []
         seen: set[str] = set()
         for nid in ranked:
-            label = str(G.nodes[nid].get("label", nid)) if nid in G.nodes else str(nid)
+            if conn is not None:
+                try:
+                    rows = list(conn.execute(
+                        "MATCH (n:node) WHERE n.id = $nid RETURN n.label",
+                        parameters={"nid": nid},
+                    ))
+                    label = str(rows[0][0] or nid) if rows else str(nid)
+                except RuntimeError:
+                    label = str(nid)
+            elif G is not None and nid in G.nodes:
+                label = str(G.nodes[nid].get("label", nid))
+            else:
+                label = str(nid)
             label = label.strip().strip("()")[:_LABEL_MAXLEN]
             if label and label.lower() not in seen:
                 seen.add(label.lower())
@@ -2269,6 +2285,7 @@ def label_communities(
     top_k: int = _LABEL_TOP_K,
     batch_size: int = _LABEL_BATCH_SIZE,
     max_concurrency: int = 4,
+    conn=None,
 ) -> dict[int, str]:
     """Return a complete ``{cid: name}`` map using ``backend`` for naming.
 
@@ -2291,7 +2308,7 @@ def label_communities(
     """
     labels = _placeholder_community_labels(communities)
     cap = len(communities) if max_communities is None else max_communities
-    lines, labeled_cids = _community_label_lines(G, communities, gods, cap, top_k)
+    lines, labeled_cids = _community_label_lines(G, communities, gods, cap, top_k, conn=conn)
     if not lines:
         return labels
 
@@ -2365,6 +2382,7 @@ def generate_community_labels(
     quiet: bool = False,
     max_concurrency: int = 4,
     batch_size: int = _LABEL_BATCH_SIZE,
+    conn=None,
 ) -> tuple[dict[int, str], str]:
     """CLI entry point: resolve a backend, name communities, and degrade to
     ``Community N`` placeholders on any failure (no backend, API error, malformed
@@ -2387,6 +2405,7 @@ def generate_community_labels(
         labels = label_communities(
             G, communities, backend=backend, model=model, gods=gods,
             max_concurrency=max_concurrency, batch_size=batch_size,
+            conn=conn,
         )
         return labels, "llm"
     except Exception as exc:

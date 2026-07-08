@@ -559,22 +559,71 @@ def _ensure_gds(conn: object) -> None:
         conn.execute("LOAD gds")
 
 
+def _ensure_leiden_comm_column(conn: object) -> None:
+    """Add leiden_comm column to node table if not present. Idempotent."""
+    try:
+        conn.execute("ALTER TABLE node ADD leiden_comm INT64 DEFAULT -1;")
+    except RuntimeError:
+        pass  # Column already exists
+
+
+def _has_leiden_comm_data(conn: object) -> bool:
+    """Check if any node has a valid leiden_comm value (not -1)."""
+    try:
+        rows = list(conn.execute(
+            "MATCH (n:node) WHERE n.leiden_comm >= 0 RETURN count(n)"
+        ))
+        return rows and rows[0][0] > 0
+    except RuntimeError:
+        return False
+
+
+def _write_leiden_comm_to_nodes(
+    conn: object,
+    communities: dict[int, list[str]],
+) -> None:
+    """Write Leiden community assignments back to node.leiden_comm property.
+
+    This enables incremental warm-start on subsequent Leiden runs via
+    initial_community_property.
+
+    Note: NeuG SET clause does not support parameterized values ($param),
+    so community ID is interpolated as a literal integer.
+    """
+    for comm_id, node_ids in communities.items():
+        for nid in node_ids:
+            try:
+                conn.execute(
+                    f"MATCH (n:node) WHERE n.id = $nid SET n.leiden_comm = {int(comm_id)}",
+                    parameters={"nid": nid},
+                )
+            except RuntimeError:
+                pass
+
+
 def _leiden_on_projected(
     conn: object,
     graph_name: str,
     resolution: float,
     concurrency: int | None,
+    *,
+    initial_community_property: str | None = None,
 ) -> dict[int, list[str]]:
     """Run Leiden on an already-projected graph, parse results, clean up.
 
     Returns communities dict: {community_id: [node_ids]}.
+
+    initial_community_property: when set, passes the property name to
+        multi_label_leiden for incremental warm-start (NeuG GDS feature).
     """
     opts = f"resolution: {resolution}"
     if concurrency is not None:
         opts += f", concurrency: {concurrency}"
+    if initial_community_property:
+        opts += f", initial_community_property: '{initial_community_property}'"
 
     rows = list(conn.execute(
-        f"CALL leiden('{graph_name}', {{{opts}}}) "
+        f"CALL multi_label_leiden('{graph_name}', {{{opts}}}) "
         f"YIELD node, community RETURN node.id, community"
     ))
 
@@ -595,18 +644,61 @@ def run_leiden(
     conn: object,
     resolution: float = 1.0,
     concurrency: int | None = None,
+    *,
+    incremental: bool = False,
 ) -> dict[int, list[str]]:
     """Run NeuG native Leiden on the full graph.
 
     Returns communities dict: {community_id: [node_ids]}.
     Raises RuntimeError if GDS extension not available.
+
+    incremental: when True, uses initial_community_property='leiden_comm'
+        for warm-start Leiden if prior community assignments exist in the
+        node table. After Leiden completes, writes new community assignments
+        back to node.leiden_comm for the next incremental run.
     """
     _ensure_gds(conn)
+    _ensure_leiden_comm_column(conn)
+
+    # Determine if warm-start is possible
+    use_warm_start = incremental and _has_leiden_comm_data(conn)
+
+    # NeuG Leiden requires ALL nodes to have valid community >= 0 for
+    # initial_community_property. Assign unassigned nodes (leiden_comm = -1)
+    # their own temporary community IDs so the algorithm has a valid start.
+    if use_warm_start:
+        try:
+            _max_rows = list(conn.execute(
+                "MATCH (n:node) WHERE n.leiden_comm >= 0 RETURN max(n.leiden_comm)"
+            ))
+            _max_comm = int(_max_rows[0][0]) if _max_rows and _max_rows[0][0] is not None else 0
+            _unassigned = list(conn.execute(
+                "MATCH (n:node) WHERE n.leiden_comm < 0 RETURN n.id"
+            ))
+            _temp_id = _max_comm + 1
+            for _row in _unassigned:
+                conn.execute(
+                    f"MATCH (n:node) WHERE n.id = $nid SET n.leiden_comm = {_temp_id}",
+                    parameters={"nid": _row[0]},
+                )
+                _temp_id += 1
+        except RuntimeError:
+            pass
+
     conn.execute(
         "CALL project_graph('graphify_full', ['node'], "
         "{'[node, edge, node]': ''})"
     )
-    return _leiden_on_projected(conn, 'graphify_full', resolution, concurrency)
+    communities = _leiden_on_projected(
+        conn, 'graphify_full', resolution, concurrency,
+        initial_community_property='leiden_comm' if use_warm_start else None,
+    )
+
+    # Write communities back to node properties for next incremental run
+    if communities:
+        _write_leiden_comm_to_nodes(conn, communities)
+
+    return communities
 
 # ---------------------------------------------------------------------------
 # God nodes — most-connected real entities (Cypher equivalent of analyze.god_nodes)
@@ -813,31 +905,19 @@ def analyze_wiki_impact(
         for nid in nids:
             node_to_concept[nid] = cid
 
-    # Step 2: Check if graph structure changed since last extract.
-    # If all nodes in the graph are covered by existing concepts, no new
-    # data was ingested — skip Leiden to avoid non-determinism noise.
-    try:
-        _node_count_rows = list(conn.execute("MATCH (n:node) RETURN count(n)"))
-        _graph_node_count = _node_count_rows[0][0] if _node_count_rows else 0
-    except RuntimeError:
-        _graph_node_count = -1  # can't determine, proceed with Leiden
-
-    if _graph_node_count > 0 and len(_all_concept_nodes) >= _graph_node_count and baseline_concepts is None:
-        # No new nodes since last extract — report all stable
-        return {
-            "concept_changes": {cid: {"type": "stable"} for cid in old_members},
-            "new_concept_candidates": [],
-            "link_changes": {"new_links": [], "stale_links": []},
-            "new_communities": {},
-            "summary": {
-                "split": 0, "growth": 0, "dissolved": 0,
-                "stable": len(old_members), "merge": 0,
-                "new": 0, "new_links": 0, "stale_links": 0,
-            },
-        }
+    # Step 2: Proceed directly to Leiden with warm-start.
+    # Previously an early-return check skipped Leiden when all nodes were
+    # covered by existing concepts. This is now unnecessary because:
+    # (a) incremental warm-start Leiden produces stable results on unchanged
+    #     portions (no non-determinism noise to avoid), and
+    # (b) edge-only changes (new call relations, removed imports) affect
+    #     community structure without changing node count — the old check
+    #     missed these entirely.
 
     # Step 3: Run Leiden on full graph (raw result, no Python postprocessing)
-    new_communities = run_leiden(conn, resolution=resolution)
+    # Use incremental warm-start so unchanged portions remain stable —
+    # detected changes reflect genuine structural shifts, not Leiden noise.
+    new_communities = run_leiden(conn, resolution=resolution, incremental=True)
 
     # Re-index by size for stable comparison (same logic as cluster.py NeuG path)
     _sorted = sorted(
@@ -856,6 +936,14 @@ def analyze_wiki_impact(
     # Stability threshold: if 50%+ of a concept's members stay in the same
     # new community, treat drift as Leiden noise, not a real split.
     # Growth threshold: only report growth if the community grew by >20%.
+    #
+    # CRITICAL: growth counts only GENUINELY-NEW nodes (not in _all_concept_nodes
+    # i.e. not part of any baseline concept), NOT old nodes that drifted in from
+    # other concepts. Empirically ~99% of size-based "growth" is old-node drift
+    # caused by Leiden's global re-optimization (verified via warm-start test):
+    # a 2-file diff produced 124 raw growths but only 2 involved genuinely-new
+    # nodes. Filtering to delta nodes removes this noise so reported growth
+    # reflects real new code absorbed into an existing concept.
     _STABILITY_THRESHOLD = 0.5
     _GROWTH_MIN_RATIO = 0.2  # at least 20% new members to count as growth
     concept_changes: dict[str, dict] = {}
@@ -880,9 +968,11 @@ def analyze_wiki_impact(
         dominant_ratio = dominant_count / len(old_nodes) if old_nodes else 0
 
         if dominant_ratio >= _STABILITY_THRESHOLD:
-            # Most members stayed together — this is stable or growth, not split
+            # Most members stayed together — this is stable or growth, not split.
+            # Count only genuinely-new nodes (absent from every baseline concept)
+            # to exclude old-node drift noise.
             new_comm_members = new_communities.get(dominant_cid, [])
-            new_in_comm = [n for n in new_comm_members if n not in old_nodes]
+            new_in_comm = [n for n in new_comm_members if n not in _all_concept_nodes]
             growth_ratio = len(new_in_comm) / len(old_nodes) if old_nodes else 0
             if new_in_comm and growth_ratio >= _GROWTH_MIN_RATIO:
                 concept_changes[old_cid] = {
@@ -910,8 +1000,9 @@ def analyze_wiki_impact(
             elif len(valid_subs) == 1:
                 dom_cid, dom_matched = next(iter(valid_subs.items()))
                 new_comm_members = new_communities.get(dom_cid, [])
-                has_growth = any(n not in old_nodes for n in new_comm_members)
-                if has_growth or len(dom_matched) != len(old_nodes):
+                # Growth only when genuinely-new nodes joined (not old-node drift)
+                has_growth = any(n not in _all_concept_nodes for n in new_comm_members)
+                if has_growth:
                     concept_changes[old_cid] = {
                         "type": "growth",
                         "old_members": old_nodes,
@@ -945,9 +1036,14 @@ def analyze_wiki_impact(
 
     # Step 5: Detect link changes between concepts
     # New links: wiki concepts whose members now share the same new community
-    # (suggesting structural connection) but don't have a links_to edge
+    # (suggesting structural connection) but don't have a links_to edge.
+    # Filter: only count co-occurrences in communities that contain at least
+    # one delta node — pure old-node drift does not constitute a real link.
     co_occurring: dict[tuple[str, str], int] = {}
     for new_cid, members in new_communities.items():
+        # Skip communities with no delta nodes (pure drift)
+        if not any(n not in _all_concept_nodes for n in members):
+            continue
         concepts_in_comm: set[str] = set()
         for n in members:
             cid = node_to_concept.get(n)
@@ -1104,18 +1200,12 @@ def run_wiki_impact(
         result = analyze_wiki_impact(conn, resolution=resolution, min_concept_size=min_concept_size, baseline_concepts=baseline_concepts)
         # Get god nodes for LLM naming prioritization (same conn)
         gods = god_nodes_cypher(conn)
-    finally:
-        close_db(db, conn)
 
-    # Optional LLM naming for all concepts in the report
-    if backend and graph_json_path:
-        gj = Path(graph_json_path)
-        if gj.exists():
+        # Optional LLM naming — uses conn to read node labels from graph.db
+        # (the NeuG backend is the source of truth for the full node set).
+        if backend:
             try:
-                from graphify.build import build_from_json
                 from graphify.llm import label_communities, detect_backend as _detect_backend
-                raw_data = _json.loads(gj.read_text(encoding="utf-8"))
-                G = build_from_json(raw_data)
                 actual_backend = backend or _detect_backend() or "gemini"
 
                 # Collect all communities that need naming:
@@ -1149,9 +1239,9 @@ def run_wiki_impact(
 
                 if communities_to_name:
                     labels = label_communities(
-                        G, communities_to_name,
+                        None, communities_to_name,
                         backend=actual_backend, model=model,
-                        gods=gods,
+                        gods=gods, conn=conn,
                     )
                     # Build reverse lookup: origin -> name
                     origin_to_name: dict[str, str] = {}
@@ -1178,6 +1268,8 @@ def run_wiki_impact(
             except Exception as _naming_exc:
                 import sys as _sys
                 print(f"[wiki-impact] LLM naming failed: {_naming_exc}", file=_sys.stderr)
+    finally:
+        close_db(db, conn)
 
     # Format output
     if output_format == "json":
@@ -1253,13 +1345,13 @@ def _format_wiki_impact_text(result: dict) -> str:
     # New concept candidates
     candidates = result.get("new_concept_candidates", [])
     if candidates:
-        # Sort by size descending, show top 15
+        # Sort by size descending, show top 10
         candidates_sorted = sorted(candidates, key=lambda c: -len(c['members']))
-        # Omit thin communities (< 5 members) from display
-        significant = [c for c in candidates_sorted if len(c['members']) >= 5]
-        thin_count = len(candidates_sorted) - len(significant)
-        show = significant[:15]
-        lines.append(f"  --- new concept candidates ({len(candidates)}) ---")
+        show = candidates_sorted[:10]
+        if len(candidates) > 10:
+            lines.append(f"  --- new concept candidates (top 10 of {len(candidates)}) ---")
+        else:
+            lines.append(f"  --- new concept candidates ({len(candidates)}) ---")
         for c in show:
             name = c.get("name", f"Community {c['community_id']}")
             members = c['members']
@@ -1269,15 +1361,9 @@ def _format_wiki_impact_text(result: dict) -> str:
             preview = ', '.join(preview_nodes)
             suffix = f" (+{n - 8} more)" if n > 8 else ""
             lines.append(f"    {name} ({n} members): {preview}{suffix}")
-        omitted = len(significant) - len(show)
-        if omitted > 0 or thin_count > 0:
-            parts = []
-            if omitted > 0:
-                parts.append(f"{omitted} more")
-            if thin_count > 0:
-                parts.append(f"{thin_count} thin communities omitted")
-            lines.append(f"    ({', '.join(parts)})")
-
+        omitted = len(candidates) - len(show)
+        if omitted > 0:
+            lines.append(f"    ({omitted} more)")
     # Link changes
     lc = result.get("link_changes", {})
     # Build concept name lookup for link display
