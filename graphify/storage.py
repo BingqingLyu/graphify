@@ -30,7 +30,8 @@ from .validate import VALID_FILE_TYPES
 
 _NODE_DDL = """CREATE NODE TABLE IF NOT EXISTS node (
     id STRING PRIMARY KEY, label STRING, type STRING,
-    source_file STRING, source_location STRING)"""
+    source_file STRING, source_location STRING,
+    leiden_comm INT64 DEFAULT -1)"""
 
 _CONCEPT_DDL = """CREATE NODE TABLE IF NOT EXISTS concept (
     id STRING PRIMARY KEY, name STRING, type STRING,
@@ -51,7 +52,7 @@ _LINKS_DDL = """CREATE REL TABLE IF NOT EXISTS links_to (
 # Column definitions for CSV output
 # ---------------------------------------------------------------------------
 
-_NODE_COLUMNS = ["id", "label", "type", "source_file", "source_location"]
+_NODE_COLUMNS = ["id", "label", "type", "source_file", "source_location", "leiden_comm"]
 _EDGE_COLUMNS = ["from_id", "to_id", "relation", "confidence",
                  "confidence_score", "source_file", "weight"]
 _CONCEPT_COLUMNS = ["id", "name", "type", "description", "source", "tags"]
@@ -142,6 +143,7 @@ def _normalize_nodes(
             "type": ft,
             "source_file": _norm_source_file(node.get("source_file"), root) or "",
             "source_location": node.get("source_location") or "",
+            "leiden_comm": int(node.get("leiden_comm", -1)),
         })
 
     edge_rows: list[dict] = []
@@ -165,15 +167,6 @@ def _normalize_nodes(
     return node_rows, edge_rows, node_types
 
 
-def _node_table_has_leiden_comm(conn: object) -> bool:
-    """Return True when the node table has the Leiden warm-start column."""
-    try:
-        list(conn.execute("MATCH (n:node) RETURN n.leiden_comm LIMIT 1"))  # type: ignore[attr-defined]
-        return True
-    except RuntimeError:
-        return False
-
-
 def _bulk_load(
     conn: object,
     tmpdir: str,
@@ -190,13 +183,8 @@ def _bulk_load(
     """Write CSVs and COPY FROM in one shot. Shared by bulk/incremental/concepts."""
     if node_rows:
         csv_path = os.path.join(tmpdir, f"{node_table}.csv")
-        write_node_columns = list(node_columns)
-        write_node_rows = node_rows
-        if node_table == "node" and "leiden_comm" not in write_node_columns and _node_table_has_leiden_comm(conn):
-            write_node_columns.append("leiden_comm")
-            write_node_rows = [{**row, "leiden_comm": row.get("leiden_comm", -1)} for row in node_rows]
-        _write_csv(csv_path, write_node_rows, write_node_columns)
-        _copy_csv(conn, csv_path, node_table, columns=write_node_columns)
+        _write_csv(csv_path, node_rows, node_columns)
+        _copy_csv(conn, csv_path, node_table, columns=node_columns)
 
     if edge_rows:
         csv_path = os.path.join(tmpdir, f"{edge_table}.csv")
@@ -351,6 +339,19 @@ def _incremental_ingest(
 
     # --- merge saved incoming edges ---
     edge_rows.extend(saved_edges)
+
+    # --- assign valid warm-start ids for newly/re-written nodes ---
+    if node_rows:
+        try:
+            _max_rows = list(conn.execute(
+                "MATCH (n:node) WHERE n.leiden_comm >= 0 RETURN max(n.leiden_comm)"
+            ))
+            _next_comm = int(_max_rows[0][0]) + 1 if _max_rows and _max_rows[0][0] is not None else 0
+            for row in node_rows:
+                row["leiden_comm"] = _next_comm
+                _next_comm += 1
+        except RuntimeError:
+            pass
 
     # --- COPY FROM bulk insert ---
     tmp_dir = tempfile.mkdtemp(prefix="graphify_inc_")
@@ -666,6 +667,9 @@ def run_leiden(
     concurrency: int | None = None,
     *,
     incremental: bool = False,
+    ensure_column: bool = False,
+    allow_temporary_writes: bool = True,
+    write_back: bool = True,
 ) -> dict[int, list[str]]:
     """Run NeuG native Leiden on the full graph.
 
@@ -674,18 +678,29 @@ def run_leiden(
 
     incremental: when True, uses initial_community_property='leiden_comm'
         for warm-start Leiden if prior community assignments exist in the
-        node table. After Leiden completes, writes new community assignments
-        back to node.leiden_comm for the next incremental run.
+        node table.
+    ensure_column: when True, migrates legacy DBs by adding node.leiden_comm
+        before running. New graphify DBs create the column in _NODE_DDL, so the
+        default stays False to avoid noisy ALTER attempts on fresh schemas.
+    allow_temporary_writes: when True, assigns temporary non-negative
+        leiden_comm values to unassigned nodes before warm-start. Read-only
+        analysis callers should pass False; if unassigned nodes exist, a
+        RuntimeError is raised instead of mutating the DB.
+    write_back: when True, writes new community assignments back to
+        node.leiden_comm.
     """
     _ensure_gds(conn)
-    _ensure_leiden_comm_column(conn)
+    if ensure_column:
+        _ensure_leiden_comm_column(conn)
 
     # Determine if warm-start is possible
     use_warm_start = incremental and _has_leiden_comm_data(conn)
 
     # NeuG Leiden requires ALL nodes to have valid community >= 0 for
     # initial_community_property. Assign unassigned nodes (leiden_comm = -1)
-    # their own temporary community IDs so the algorithm has a valid start.
+    # temporary community IDs. In read-only analysis mode, restore those nodes
+    # to -1 after Leiden so wiki-impact is idempotent from the caller's view.
+    temporary_unassigned: list[str] = []
     if use_warm_start:
         try:
             _max_rows = list(conn.execute(
@@ -693,29 +708,50 @@ def run_leiden(
             ))
             _max_comm = int(_max_rows[0][0]) if _max_rows and _max_rows[0][0] is not None else 0
             _unassigned = list(conn.execute(
-                "MATCH (n:node) WHERE n.leiden_comm < 0 RETURN n.id"
+                "MATCH (n:node) WHERE n.leiden_comm < 0 RETURN n.id ORDER BY n.id"
             ))
+            temporary_unassigned = [str(_row[0]) for _row in _unassigned]
+            if temporary_unassigned and not allow_temporary_writes:
+                raise RuntimeError(
+                    "strict read-only Leiden warm-start is not possible while "
+                    "nodes with leiden_comm < 0 exist; run a write-enabled "
+                    "cluster/extract step first or use a NeuG read-only "
+                    "initial-community API when available."
+                )
             _temp_id = _max_comm + 1
-            for _row in _unassigned:
+            for _nid in temporary_unassigned:
                 conn.execute(
                     f"MATCH (n:node) WHERE n.id = $nid SET n.leiden_comm = {_temp_id}",
-                    parameters={"nid": _row[0]},
+                    parameters={"nid": _nid},
                 )
                 _temp_id += 1
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            if "strict read-only Leiden warm-start" in str(exc):
+                raise
+            temporary_unassigned = []
 
-    conn.execute(
-        "CALL project_graph('graphify_full', ['node'], "
-        "{'[node, edge, node]': ''})"
-    )
-    communities = _leiden_on_projected(
-        conn, 'graphify_full', resolution, concurrency,
-        initial_community_property='leiden_comm' if use_warm_start else None,
-    )
+    try:
+        conn.execute(
+            "CALL project_graph('graphify_full', ['node'], "
+            "{'[node, edge, node]': ''})"
+        )
+        communities = _leiden_on_projected(
+            conn, 'graphify_full', resolution, concurrency,
+            initial_community_property='leiden_comm' if use_warm_start else None,
+        )
+    finally:
+        if use_warm_start and not write_back and temporary_unassigned:
+            for _nid in temporary_unassigned:
+                try:
+                    conn.execute(
+                        "MATCH (n:node) WHERE n.id = $nid SET n.leiden_comm = -1",
+                        parameters={"nid": _nid},
+                    )
+                except RuntimeError:
+                    pass
 
-    # Write communities back to node properties for next incremental run
-    if communities:
+    # Write communities back to node properties for the next incremental run.
+    if write_back and communities:
         _write_leiden_comm_to_nodes(conn, communities)
 
     return communities
@@ -976,6 +1012,20 @@ def _get_concept_links(conn: object) -> set[tuple[str, str]]:
     return result
 
 
+def _get_concept_names(conn: object) -> dict[str, str]:
+    """Query concept display names from the DB."""
+    result: dict[str, str] = {}
+    try:
+        rows = conn.execute("MATCH (c:concept) RETURN c.id, c.name")
+        for row in rows:
+            cid, name = str(row[0]), str(row[1] or "")
+            if cid and name:
+                result[cid] = name
+    except RuntimeError:
+        pass
+    return result
+
+
 def _get_wiki_concepts(conn: object) -> dict[str, dict]:
     """Query all concepts with their metadata.
 
@@ -1037,15 +1087,19 @@ def analyze_wiki_impact(
     # Step 1: Get baseline concepts (from parameter or graph.db)
     if baseline_concepts is not None:
         old_members: dict[str, list[str]] = {}
+        concept_names: dict[str, str] = {}
         old_links: set[tuple[str, str]] = set()
         for c in baseline_concepts:
             cid = c.get("id", "")
             if cid:
                 old_members[cid] = list(c.get("members", []))
+                if c.get("name"):
+                    concept_names[cid] = str(c.get("name"))
                 for target in c.get("links", []):
                     old_links.add((cid, target))
     else:
         old_members = get_concept_members(conn)
+        concept_names = _get_concept_names(conn)
         old_links = _get_concept_links(conn)
 
     # Build full node set BEFORE min_concept_size filtering (for change detection)
@@ -1073,7 +1127,15 @@ def analyze_wiki_impact(
     # Step 3: Run Leiden on full graph (raw result, no Python postprocessing)
     # Use incremental warm-start so unchanged portions remain stable —
     # detected changes reflect genuine structural shifts, not Leiden noise.
-    new_communities = run_leiden(conn, resolution=resolution, incremental=True)
+    new_communities = run_leiden(
+        conn,
+        resolution=resolution,
+        concurrency=1,
+        incremental=True,
+        ensure_column=False,
+        allow_temporary_writes=False,
+        write_back=False,
+    )
 
     # Re-index by size for stable comparison (same logic as cluster.py NeuG path)
     _sorted = sorted(
@@ -1129,12 +1191,15 @@ def analyze_wiki_impact(
             # to exclude old-node drift noise.
             new_comm_members = new_communities.get(dominant_cid, [])
             new_in_comm = [n for n in new_comm_members if n not in _all_concept_nodes]
+            old_drift_in_comm = [n for n in new_comm_members if n in _all_concept_nodes and n not in old_nodes]
             growth_ratio = len(new_in_comm) / len(old_nodes) if old_nodes else 0
             if new_in_comm and growth_ratio >= _GROWTH_MIN_RATIO:
                 concept_changes[old_cid] = {
                     "type": "growth",
                     "old_members": old_nodes,
                     "new_members": new_comm_members,
+                    "delta_members": sorted(new_in_comm),
+                    "old_drift_members": sorted(old_drift_in_comm),
                 }
             else:
                 concept_changes[old_cid] = {"type": "stable"}
@@ -1157,12 +1222,15 @@ def analyze_wiki_impact(
                 dom_cid, dom_matched = next(iter(valid_subs.items()))
                 new_comm_members = new_communities.get(dom_cid, [])
                 # Growth only when genuinely-new nodes joined (not old-node drift)
-                has_growth = any(n not in _all_concept_nodes for n in new_comm_members)
-                if has_growth:
+                delta_members = [n for n in new_comm_members if n not in _all_concept_nodes]
+                old_drift_members = [n for n in new_comm_members if n in _all_concept_nodes and n not in old_nodes]
+                if delta_members:
                     concept_changes[old_cid] = {
                         "type": "growth",
                         "old_members": old_nodes,
                         "new_members": new_comm_members,
+                        "delta_members": sorted(delta_members),
+                        "old_drift_members": sorted(old_drift_members),
                     }
                 else:
                     concept_changes[old_cid] = {"type": "stable"}
@@ -1173,18 +1241,37 @@ def analyze_wiki_impact(
                 }
 
     # Step 4: Detect new concept candidates
-    # A community where >50% of nodes don't belong to any existing concept
+    # A community qualifies as a new-concept candidate only when BOTH hold:
+    #   (a) novelty_ratio > 0.5 — most members don't belong to any concept in
+    #       the (min_concept_size-filtered) baseline lookup, AND
+    #   (b) delta_ratio > 0.5 — most members are genuinely-new delta nodes
+    #       (absent from EVERY baseline concept, i.e. not in _all_concept_nodes).
+    # The delta gate mirrors the growth/link filters: without it, a community
+    # made purely of old code that the wiki simply never covered (delta == 0,
+    # or whose members only fell out of the lookup due to min_concept_size)
+    # would be mislabeled "new". Those are baseline blind spots, not concepts
+    # introduced by this change.
+    _NEW_CONCEPT_MIN_DELTA_RATIO = 0.5
     new_concept_candidates: list[dict] = []
 
     for new_cid, members in new_communities.items():
+        if not members:
+            continue
         known = sum(1 for n in members if n in node_to_concept)
-        novelty_ratio = 1.0 - (known / len(members)) if members else 0.0
+        novelty_ratio = 1.0 - (known / len(members))
+        delta_count = sum(1 for n in members if n not in _all_concept_nodes)
+        delta_ratio = delta_count / len(members)
 
-        if novelty_ratio > 0.5 and len(members) >= min_concept_size:
+        if (
+            novelty_ratio > 0.5
+            and delta_ratio > _NEW_CONCEPT_MIN_DELTA_RATIO
+            and len(members) >= min_concept_size
+        ):
             new_concept_candidates.append({
                 "community_id": new_cid,
                 "members": sorted(members),
                 "novelty_ratio": round(novelty_ratio, 3),
+                "delta_ratio": round(delta_ratio, 3),
                 "known_concepts": sorted(set(
                     node_to_concept[n] for n in members if n in node_to_concept
                 )),
@@ -1212,13 +1299,18 @@ def analyze_wiki_impact(
                     co_occurring[key] = co_occurring.get(key, 0) + 1
 
     new_links: list[dict] = []
+    weak_new_links: list[dict] = []
     for (c1, c2), count in co_occurring.items():
         if (c1, c2) not in old_links and (c2, c1) not in old_links:
-            new_links.append({
+            link = {
                 "from": c1,
                 "to": c2,
                 "co_occurrence": count,
-            })
+            }
+            if count >= 2:
+                new_links.append(link)
+            else:
+                weak_new_links.append(link)
 
     # Stale links: links_to edges where concepts no longer co-occur
     stale_links: list[dict] = []
@@ -1237,14 +1329,17 @@ def analyze_wiki_impact(
         "stable": sum(1 for c in concept_changes.values() if c["type"] == "stable"),
         "new": len(new_concept_candidates),
         "new_links": len(new_links),
+        "weak_new_links": len(weak_new_links),
         "stale_links": len(stale_links),
     }
 
     return {
         "concept_changes": concept_changes,
         "new_concept_candidates": new_concept_candidates,
+        "concept_names": concept_names,
         "link_changes": {
             "new_links": new_links,
+            "weak_new_links": weak_new_links,
             "stale_links": stale_links,
         },
         "new_communities": new_communities,
@@ -1349,7 +1444,9 @@ def run_wiki_impact(
         else:
             raise ValueError(f"cannot detect wiki format for {baseline_path}")
 
-    # Run analysis
+    # Run analysis directly against the requested DB. wiki-impact uses
+    # read-only Leiden flags below, so this path must not alter schema or
+    # write node.leiden_comm.
     db, conn = init_db(db_path)
     ensure_schema(conn, create_tables=False)
     try:
@@ -1393,6 +1490,23 @@ def run_wiki_impact(
                     key_to_origin[next_key] = f"new:{c['community_id']}"
                     next_key += 1
 
+                link_endpoint_cids: set[str] = set()
+                for link in result.get("link_changes", {}).get("new_links", []):
+                    link_endpoint_cids.update([link["from"], link["to"]])
+                for link in result.get("link_changes", {}).get("weak_new_links", []):
+                    link_endpoint_cids.update([link["from"], link["to"]])
+                for cid in sorted(link_endpoint_cids):
+                    current_name = result.get("concept_names", {}).get(cid, "")
+                    if current_name and not current_name.startswith("Community "):
+                        continue
+                    members = result.get("concept_changes", {}).get(cid, {}).get("old_members") or []
+                    if not members and baseline_concepts is None:
+                        members = get_concept_members(conn).get(cid, [])
+                    if members:
+                        communities_to_name[next_key] = members
+                        key_to_origin[next_key] = f"link:{cid}"
+                        next_key += 1
+
                 if communities_to_name:
                     labels = label_communities(
                         None, communities_to_name,
@@ -1421,6 +1535,10 @@ def run_wiki_impact(
                     for c in result.get("new_concept_candidates", []):
                         nkey = f"new:{c['community_id']}"
                         c["name"] = origin_to_name.get(nkey, f"Community {c['community_id']}")
+                    for cid in link_endpoint_cids:
+                        lkey = f"link:{cid}"
+                        if lkey in origin_to_name:
+                            result.setdefault("concept_names", {})[cid] = origin_to_name[lkey]
             except Exception as _naming_exc:
                 import sys as _sys
                 print(f"[wiki-impact] LLM naming failed: {_naming_exc}", file=_sys.stderr)
@@ -1432,6 +1550,7 @@ def run_wiki_impact(
         serializable = {
             "concept_changes": result["concept_changes"],
             "new_concept_candidates": result["new_concept_candidates"],
+            "concept_names": result.get("concept_names", {}),
             "link_changes": result["link_changes"],
             "structural_context": result.get("structural_context", {}),
             "summary": result["summary"],
@@ -1445,6 +1564,7 @@ def _format_wiki_impact_text(result: dict) -> str:
     """Format wiki-impact result as human-readable text."""
     lines: list[str] = []
     _sum = result["summary"]
+    _concept_names = result.get("concept_names", {})
     lines.append("Wiki impact:")
     lines.append("  concept changes:")
     lines.append(f"    stable:    {_sum.get('stable', 0)}")
@@ -1454,6 +1574,8 @@ def _format_wiki_impact_text(result: dict) -> str:
     lines.append(f"    dissolved: {_sum.get('dissolved', 0)}")
     lines.append(f"  new concepts:  {_sum.get('new', 0)}")
     lines.append(f"  new links:     {_sum.get('new_links', 0)}")
+    if _sum.get('weak_new_links', 0):
+        lines.append(f"  weak links:    {_sum.get('weak_new_links', 0)} (co-occurrence=1, hidden)")
     lines.append(f"  stale links:   {_sum.get('stale_links', 0)}")
 
     # Split details
@@ -1461,7 +1583,7 @@ def _format_wiki_impact_text(result: dict) -> str:
     if splits:
         lines.append(f"  --- split ({len(splits)}) ---")
         for cid, info in splits:
-            name = info.get('name', cid)
+            name = info.get('name', _concept_names.get(cid, cid))
             old_n = len(info.get('old_members', []))
             into = info.get('split_into', {})
             split_names = info.get('split_names', {})
@@ -1473,21 +1595,26 @@ def _format_wiki_impact_text(result: dict) -> str:
     # Growth details (top 10)
     growths = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "growth"]
     if growths:
-        growths.sort(key=lambda x: len(x[1].get('new_members', [])) - len(x[1].get('old_members', [])), reverse=True)
+        growths.sort(key=lambda x: len(x[1].get('delta_members', [])), reverse=True)
         show = growths[:10]
         lines.append(f"  --- growth (top {len(show)} of {len(growths)}) ---")
         for cid, info in show:
-            name = info.get('name', cid)
+            name = info.get('name', _concept_names.get(cid, cid))
             old_n = len(info.get('old_members', []))
             new_n = len(info.get('new_members', []))
-            lines.append(f"    {name}: {old_n} -> {new_n} members (+{new_n - old_n})")
+            delta_n = len(info.get('delta_members', []))
+            drift_n = len(info.get('old_drift_members', []))
+            detail = f"+{delta_n} delta"
+            if drift_n:
+                detail += f", +{drift_n} old-drift"
+            lines.append(f"    {name}: {old_n} -> {new_n} members ({detail})")
 
     # Dissolved details
     dissolved = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "dissolved"]
     if dissolved:
         lines.append(f"  --- dissolved ({len(dissolved)}) ---")
         for cid, info in dissolved:
-            name = info.get('name', cid)
+            name = info.get('name', _concept_names.get(cid, cid))
             lines.append(f"    {name} ({len(info.get('old_members', []))} members lost)")
 
     # Merge details
@@ -1495,7 +1622,7 @@ def _format_wiki_impact_text(result: dict) -> str:
     if merges:
         lines.append(f"  --- merge ({len(merges)}) ---")
         for cid, info in merges:
-            name = info.get('name', cid)
+            name = info.get('name', _concept_names.get(cid, cid))
             lines.append(f"    {name} merged with {info.get('merged_with', [])}")
 
     # New concept candidates
@@ -1523,9 +1650,9 @@ def _format_wiki_impact_text(result: dict) -> str:
     # Link changes
     lc = result.get("link_changes", {})
     # Build concept name lookup for link display
-    _cid_names: dict[str, str] = {}
+    _cid_names: dict[str, str] = dict(result.get("concept_names", {}))
     for cid, info in result["concept_changes"].items():
-        _cid_names[cid] = info.get('name', cid)
+        _cid_names[cid] = info.get('name', _cid_names.get(cid, cid))
     new_links = lc.get("new_links", [])
     if new_links:
         lines.append(f"  --- new links ({len(new_links)}, showing top 10) ---")
@@ -1534,6 +1661,9 @@ def _format_wiki_impact_text(result: dict) -> str:
             from_name = _cid_names.get(link['from'], link['from'])
             to_name = _cid_names.get(link['to'], link['to'])
             lines.append(f"    {from_name} -> {to_name} (co-occurrence: {link['co_occurrence']})")
+    weak_new_links = lc.get("weak_new_links", [])
+    if weak_new_links:
+        lines.append(f"  --- weak new links omitted ({len(weak_new_links)}, co-occurrence=1) ---")
     stale_links = lc.get("stale_links", [])
     if stale_links:
         lines.append(f"  --- stale links ({len(stale_links)}) ---")

@@ -88,18 +88,36 @@ def test_ingest_extraction_merge_mode(tmp_db):
 
 
 def test_ingest_extraction_incremental_after_leiden_column(tmp_db):
-    from graphify.storage import ingest_extraction, _ensure_leiden_comm_column
+    from graphify.storage import ingest_extraction
     db, conn = _init(tmp_db)
     ext = _load_extraction()
     ingest_extraction(conn, ext, incremental=False)
-    _ensure_leiden_comm_column(conn)
+    conn.execute("MATCH (n:node) SET n.leiden_comm = 10")
     ext["nodes"][0]["label"] = "TransformerV2"
     ingest_extraction(conn, ext, incremental=True)
     rows = _query(
         conn,
         "MATCH (n:node) WHERE n.id = 'n_transformer' RETURN n.label, n.leiden_comm",
     )
-    assert rows[0] == ["TransformerV2", -1]
+    assert rows[0][0] == "TransformerV2"
+    assert rows[0][1] >= 0
+    _close(db, conn)
+
+
+def test_ingest_extraction_incremental_prepares_nonnegative_leiden_comm(tmp_db):
+    from graphify.storage import ingest_extraction
+    db, conn = _init(tmp_db)
+    ext = _load_extraction()
+    ingest_extraction(conn, ext, incremental=False)
+    conn.execute("MATCH (n:node) SET n.leiden_comm = 10")
+    ext["nodes"][0]["label"] = "TransformerV2"
+    ingest_extraction(conn, ext, incremental=True)
+    rows = _query(
+        conn,
+        "MATCH (n:node) RETURN min(n.leiden_comm), count(n)",
+    )
+    assert rows[0][0] >= 0
+    assert rows[0][1] >= 3
     _close(db, conn)
 
 
@@ -409,8 +427,9 @@ def test_import_wiki_auto_detect(tmp_db, tmp_path):
 
 # --- analyze_wiki_impact ---
 
-def test_analyze_wiki_impact_new_concept(tmp_db):
+def test_analyze_wiki_impact_new_concept(tmp_db, monkeypatch):
     """A community where >50% of nodes are unknown should be a new concept candidate."""
+    import graphify.storage as storage
     from graphify.storage import analyze_wiki_impact, ingest_concepts, ingest_extraction
     db, conn = _init(tmp_db)
 
@@ -428,6 +447,7 @@ def test_analyze_wiki_impact_new_concept(tmp_db):
         ],
     }
     ingest_extraction(conn, base, incremental=False)
+    conn.execute("MATCH (n:node) SET n.leiden_comm = 10")
 
     # Import wiki concept covering n1, n2
     ingest_concepts(conn, [{
@@ -448,6 +468,11 @@ def test_analyze_wiki_impact_new_concept(tmp_db):
         ],
     }
     ingest_extraction(conn, delta, incremental=True)
+
+    monkeypatch.setattr(storage, "run_leiden", lambda *args, **kwargs: {
+        0: ["n1", "n2", "x1", "x2", "x3"],
+        1: ["n3", "n4"],
+    })
 
     # Now analyze: graph.db has old+new data, concepts still reflect old state
     result = analyze_wiki_impact(conn)
@@ -514,4 +539,158 @@ def test_get_concept_links(tmp_db):
     links = _get_concept_links(conn)
     assert ("c1", "c2") in links
     _close(db, conn)
+
+
+def test_analyze_wiki_impact_tracks_delta_and_weak_links(monkeypatch):
+    import graphify.storage as storage
+
+    calls = []
+
+    def fake_run_leiden(
+        conn,
+        resolution=1.0,
+        concurrency=None,
+        *,
+        incremental=False,
+        ensure_column=True,
+        allow_temporary_writes=True,
+        write_back=True,
+    ):
+        calls.append({
+            "incremental": incremental,
+            "ensure_column": ensure_column,
+            "allow_temporary_writes": allow_temporary_writes,
+            "write_back": write_back,
+        })
+        return {
+            0: ["old_a", "old_b", "drift", "delta1", "delta2"],
+            1: ["old_c"],
+        }
+
+    monkeypatch.setattr(storage, "run_leiden", fake_run_leiden)
+    result = storage.analyze_wiki_impact(
+        object(),
+        baseline_concepts=[
+            {"id": "c1", "name": "Concept One", "members": ["old_a", "old_b"]},
+            {"id": "c2", "name": "Concept Two", "members": ["drift"]},
+            {"id": "c3", "name": "Concept Three", "members": ["old_c"]},
+        ],
+    )
+
+    growth = result["concept_changes"]["c1"]
+    assert calls == [{
+        "incremental": True,
+        "ensure_column": False,
+        "allow_temporary_writes": False,
+        "write_back": False,
+    }]
+    assert growth["type"] == "growth"
+    assert growth["delta_members"] == ["delta1", "delta2"]
+    assert growth["old_drift_members"] == ["drift"]
+    assert result["summary"]["new_links"] == 0
+    assert result["summary"]["weak_new_links"] == 1
+    assert result["link_changes"]["weak_new_links"] == [
+        {"from": "c1", "to": "c2", "co_occurrence": 1}
+    ]
+    assert result["concept_names"]["c2"] == "Concept Two"
+
+
+def test_format_wiki_impact_shows_delta_and_omits_weak_links():
+    from graphify.storage import _format_wiki_impact_text
+
+    text = _format_wiki_impact_text({
+        "summary": {
+            "stable": 0,
+            "growth": 1,
+            "merge": 0,
+            "split": 0,
+            "dissolved": 0,
+            "new": 0,
+            "new_links": 0,
+            "weak_new_links": 1,
+            "stale_links": 0,
+        },
+        "concept_names": {"c1": "Concept One", "c2": "Concept Two"},
+        "concept_changes": {
+            "c1": {
+                "type": "growth",
+                "name": "Concept One",
+                "old_members": ["old_a", "old_b"],
+                "new_members": ["old_a", "old_b", "drift", "delta1", "delta2"],
+                "delta_members": ["delta1", "delta2"],
+                "old_drift_members": ["drift"],
+            }
+        },
+        "new_concept_candidates": [],
+        "link_changes": {
+            "new_links": [],
+            "weak_new_links": [{"from": "c1", "to": "c2", "co_occurrence": 1}],
+            "stale_links": [],
+        },
+    })
+
+    assert "Concept One: 2 -> 5 members (+2 delta, +1 old-drift)" in text
+    assert "weak links:    1 (co-occurrence=1, hidden)" in text
+    assert "weak new links omitted (1, co-occurrence=1)" in text
+    assert "Concept One -> Concept Two" not in text
+
+
+def test_run_leiden_write_back_false_restores_temporary_assignments(monkeypatch):
+    import graphify.storage as storage
+
+    class FakeConn:
+        def __init__(self):
+            self.set_queries = []
+
+        def execute(self, query, parameters=None):
+            if "max(n.leiden_comm)" in query:
+                return [[5]]
+            if "n.leiden_comm < 0 RETURN n.id" in query:
+                return [["new1"], ["new2"]]
+            if "SET n.leiden_comm" in query:
+                self.set_queries.append((query, parameters))
+            return []
+
+    fake_conn = FakeConn()
+    writes = []
+    monkeypatch.setattr(storage, "_ensure_gds", lambda conn: None)
+    monkeypatch.setattr(storage, "_ensure_leiden_comm_column", lambda conn: None)
+    monkeypatch.setattr(storage, "_has_leiden_comm_data", lambda conn: True)
+    monkeypatch.setattr(storage, "_leiden_on_projected", lambda *args, **kwargs: {1: ["new1"]})
+    monkeypatch.setattr(storage, "_write_leiden_comm_to_nodes", lambda conn, communities: writes.append(communities))
+
+    result = storage.run_leiden(fake_conn, incremental=True, write_back=False, allow_temporary_writes=True)
+
+    assert result == {1: ["new1"]}
+    assert writes == []
+    set_values = [query.rsplit("=", 1)[-1].strip() for query, _ in fake_conn.set_queries]
+    assert set_values == ["6", "7", "-1", "-1"]
+
+
+def test_run_leiden_readonly_rejects_temporary_assignments(monkeypatch):
+    import pytest
+    import graphify.storage as storage
+
+    class FakeConn:
+        def execute(self, query, parameters=None):
+            if "max(n.leiden_comm)" in query:
+                return [[5]]
+            if "n.leiden_comm < 0 RETURN n.id" in query:
+                return [["new1"]]
+            if "SET n.leiden_comm" in query or "ALTER TABLE" in query:
+                raise AssertionError(f"unexpected write query: {query}")
+            return []
+
+    monkeypatch.setattr(storage, "_ensure_gds", lambda conn: None)
+    monkeypatch.setattr(storage, "_ensure_leiden_comm_column", lambda conn: (_ for _ in ()).throw(AssertionError("unexpected schema ensure")))
+    monkeypatch.setattr(storage, "_has_leiden_comm_data", lambda conn: True)
+
+    with pytest.raises(RuntimeError, match="strict read-only Leiden warm-start"):
+        storage.run_leiden(
+            FakeConn(),
+            incremental=True,
+            ensure_column=False,
+            allow_temporary_writes=False,
+            write_back=False,
+        )
 
