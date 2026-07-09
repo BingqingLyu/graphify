@@ -682,10 +682,9 @@ def run_leiden(
     ensure_column: when True, migrates legacy DBs by adding node.leiden_comm
         before running. New graphify DBs create the column in _NODE_DDL, so the
         default stays False to avoid noisy ALTER attempts on fresh schemas.
-    allow_temporary_writes: when True, assigns temporary non-negative
-        leiden_comm values to unassigned nodes before warm-start. Read-only
-        analysis callers should pass False; if unassigned nodes exist, a
-        RuntimeError is raised instead of mutating the DB.
+    allow_temporary_writes: deprecated, kept for backward compatibility.
+        NeuG multi_label_leiden handles leiden_comm = -1 natively (treats
+        such nodes as unassigned). No temporary writes are needed.
     write_back: when True, writes new community assignments back to
         node.leiden_comm.
     """
@@ -696,59 +695,18 @@ def run_leiden(
     # Determine if warm-start is possible
     use_warm_start = incremental and _has_leiden_comm_data(conn)
 
-    # NeuG Leiden requires ALL nodes to have valid community >= 0 for
-    # initial_community_property. Assign unassigned nodes (leiden_comm = -1)
-    # temporary community IDs. In read-only analysis mode, restore those nodes
-    # to -1 after Leiden so wiki-impact is idempotent from the caller's view.
-    temporary_unassigned: list[str] = []
-    if use_warm_start:
-        try:
-            _max_rows = list(conn.execute(
-                "MATCH (n:node) WHERE n.leiden_comm >= 0 RETURN max(n.leiden_comm)"
-            ))
-            _max_comm = int(_max_rows[0][0]) if _max_rows and _max_rows[0][0] is not None else 0
-            _unassigned = list(conn.execute(
-                "MATCH (n:node) WHERE n.leiden_comm < 0 RETURN n.id ORDER BY n.id"
-            ))
-            temporary_unassigned = [str(_row[0]) for _row in _unassigned]
-            if temporary_unassigned and not allow_temporary_writes:
-                raise RuntimeError(
-                    "strict read-only Leiden warm-start is not possible while "
-                    "nodes with leiden_comm < 0 exist; run a write-enabled "
-                    "cluster/extract step first or use a NeuG read-only "
-                    "initial-community API when available."
-                )
-            _temp_id = _max_comm + 1
-            for _nid in temporary_unassigned:
-                conn.execute(
-                    f"MATCH (n:node) WHERE n.id = $nid SET n.leiden_comm = {_temp_id}",
-                    parameters={"nid": _nid},
-                )
-                _temp_id += 1
-        except RuntimeError as exc:
-            if "strict read-only Leiden warm-start" in str(exc):
-                raise
-            temporary_unassigned = []
+    # NeuG multi_label_leiden handles leiden_comm = -1 natively: nodes with
+    # -1 are treated as unassigned and freely assigned by the algorithm.
+    # No temporary community ID assignment is needed.
 
-    try:
-        conn.execute(
-            "CALL project_graph('graphify_full', ['node'], "
-            "{'[node, edge, node]': ''})"
-        )
-        communities = _leiden_on_projected(
-            conn, 'graphify_full', resolution, concurrency,
-            initial_community_property='leiden_comm' if use_warm_start else None,
-        )
-    finally:
-        if use_warm_start and not write_back and temporary_unassigned:
-            for _nid in temporary_unassigned:
-                try:
-                    conn.execute(
-                        "MATCH (n:node) WHERE n.id = $nid SET n.leiden_comm = -1",
-                        parameters={"nid": _nid},
-                    )
-                except RuntimeError:
-                    pass
+    conn.execute(
+        "CALL project_graph('graphify_full', ['node'], "
+        "{'[node, edge, node]': ''})"
+    )
+    communities = _leiden_on_projected(
+        conn, 'graphify_full', resolution, concurrency,
+        initial_community_property='leiden_comm' if use_warm_start else None,
+    )
 
     # Write communities back to node properties for the next incremental run.
     if write_back and communities:
@@ -1165,6 +1123,7 @@ def analyze_wiki_impact(
     _STABILITY_THRESHOLD = 0.5
     _GROWTH_MIN_RATIO = 0.2  # at least 20% new members to count as growth
     concept_changes: dict[str, dict] = {}
+    dominant_assignments: dict[str, int] = {}
 
     for old_cid, old_nodes in old_members.items():
         new_targets: dict[int, list[str]] = {}
@@ -1186,6 +1145,7 @@ def analyze_wiki_impact(
         dominant_ratio = dominant_count / len(old_nodes) if old_nodes else 0
 
         if dominant_ratio >= _STABILITY_THRESHOLD:
+            dominant_assignments[old_cid] = dominant_cid
             # Most members stayed together — this is stable or growth, not split.
             # Count only genuinely-new nodes (absent from every baseline concept)
             # to exclude old-node drift noise.
@@ -1198,6 +1158,7 @@ def analyze_wiki_impact(
                     "type": "growth",
                     "old_members": old_nodes,
                     "new_members": new_comm_members,
+                    "target_community": dominant_cid,
                     "delta_members": sorted(new_in_comm),
                     "old_drift_members": sorted(old_drift_in_comm),
                 }
@@ -1229,6 +1190,7 @@ def analyze_wiki_impact(
                         "type": "growth",
                         "old_members": old_nodes,
                         "new_members": new_comm_members,
+                        "target_community": dom_cid,
                         "delta_members": sorted(delta_members),
                         "old_drift_members": sorted(old_drift_members),
                     }
@@ -1239,6 +1201,63 @@ def analyze_wiki_impact(
                     "type": "dissolved",
                     "old_members": old_nodes,
                 }
+
+    # Step 3.5: Detect merges / collapses (collapse-first).
+    # Multiple concepts whose dominant community is the same new community
+    # have effectively merged. When too many concepts pile into one community
+    # it is a Leiden collapse (god community), not a genuine merge.
+    _MERGE_MAX_CONCEPTS = 10
+    _GOD_THRESHOLD = 1000
+    merge_groups: dict[int, list[str]] = {}
+    for old_cid, dom_cid in dominant_assignments.items():
+        merge_groups.setdefault(dom_cid, []).append(old_cid)
+
+    # First pass: identify collapse target communities.
+    collapse_targets: set[int] = set()
+    for dom_cid, group in merge_groups.items():
+        if len(group) < 2:
+            continue
+        target_size = len(new_communities.get(dom_cid, []))
+        if len(group) > _MERGE_MAX_CONCEPTS or target_size >= _GOD_THRESHOLD:
+            collapse_targets.add(dom_cid)
+
+    # Second pass: reclassify concepts in each group.
+    for dom_cid, group in merge_groups.items():
+        if len(group) < 2:
+            continue
+        is_collapse = dom_cid in collapse_targets
+        change_type = "collapse" if is_collapse else "merge"
+        target_size = len(new_communities.get(dom_cid, []))
+        for old_cid in group:
+            existing = concept_changes.get(old_cid, {})
+            if existing.get("type") in ("growth", "stable"):
+                concept_changes[old_cid] = {
+                    "type": change_type,
+                    "old_members": old_members[old_cid],
+                    "target_community": dom_cid,
+                    "target_size": target_size,
+                    "group_size": len(group),
+                    "merged_with": sorted(c for c in group if c != old_cid),
+                }
+
+    # Step 3.6: Catch growth concepts (path B) whose target is a collapse
+    # community. These escaped Step 3.5 because they weren't in
+    # dominant_assignments (dominant_ratio < 0.5). Also catches growth into
+    # any god-sized community (>=1000) even if no other concept targeted it.
+    for old_cid, change in concept_changes.items():
+        if change.get("type") != "growth":
+            continue
+        target_comm = change.get("target_community", -1)
+        new_members = change.get("new_members") or []
+        if target_comm in collapse_targets or len(new_members) >= _GOD_THRESHOLD:
+            concept_changes[old_cid] = {
+                "type": "collapse",
+                "old_members": change.get("old_members", []),
+                "target_community": target_comm,
+                "target_size": len(new_members),
+                "group_size": 0,
+                "merged_with": [],
+            }
 
     # Step 4: Detect new concept candidates
     # A community qualifies as a new-concept candidate only when BOTH hold:
@@ -1325,12 +1344,41 @@ def analyze_wiki_impact(
     summary = {
         "split": sum(1 for c in concept_changes.values() if c["type"] == "split"),
         "growth": sum(1 for c in concept_changes.values() if c["type"] == "growth"),
+        "merge": sum(1 for c in concept_changes.values() if c["type"] == "merge"),
+        "collapse": sum(1 for c in concept_changes.values() if c["type"] == "collapse"),
         "dissolved": sum(1 for c in concept_changes.values() if c["type"] == "dissolved"),
         "stable": sum(1 for c in concept_changes.values() if c["type"] == "stable"),
         "new": len(new_concept_candidates),
         "new_links": len(new_links),
         "weak_new_links": len(weak_new_links),
         "stale_links": len(stale_links),
+    }
+
+    # Community size distribution: baseline (extract-time leiden_comm in DB)
+    # vs re-clustered (this run's warm-start Leiden result). Lets the caller
+    # see whether re-clustering collapsed into god communities.
+    try:
+        _bl_rows = list(conn.execute(
+            "MATCH (n:node) WHERE n.leiden_comm IS NOT NULL "
+            "RETURN n.leiden_comm, count(n) AS sz ORDER BY sz DESC"
+        ))
+        _bl_sizes = [r[1] for r in _bl_rows]
+    except Exception:
+        _bl_sizes = []
+    _new_sizes = sorted((len(v) for v in new_communities.values()), reverse=True)
+    community_distribution = {
+        "baseline": {
+            "count": len(_bl_sizes),
+            "max": _bl_sizes[0] if _bl_sizes else 0,
+            "god_count": sum(1 for s in _bl_sizes if s >= _GOD_THRESHOLD),
+            "top10": _bl_sizes[:10],
+        },
+        "reclustered": {
+            "count": len(_new_sizes),
+            "max": _new_sizes[0] if _new_sizes else 0,
+            "god_count": sum(1 for s in _new_sizes if s >= _GOD_THRESHOLD),
+            "top10": _new_sizes[:10],
+        },
     }
 
     return {
@@ -1343,6 +1391,7 @@ def analyze_wiki_impact(
             "stale_links": stale_links,
         },
         "new_communities": new_communities,
+        "community_distribution": community_distribution,
         "summary": summary,
     }
 
@@ -1553,6 +1602,7 @@ def run_wiki_impact(
             "concept_names": result.get("concept_names", {}),
             "link_changes": result["link_changes"],
             "structural_context": result.get("structural_context", {}),
+            "community_distribution": result.get("community_distribution", {}),
             "summary": result["summary"],
         }
         return _json.dumps(serializable, indent=2, default=str)
@@ -1565,11 +1615,19 @@ def _format_wiki_impact_text(result: dict) -> str:
     lines: list[str] = []
     _sum = result["summary"]
     _concept_names = result.get("concept_names", {})
+    _cd = result.get("community_distribution") or {}
     lines.append("Wiki impact:")
+    if _cd:
+        _bl = _cd.get("baseline", {})
+        _rc = _cd.get("reclustered", {})
+        lines.append("  community distribution:")
+        lines.append(f"    baseline (extract):  {_bl.get('count', 0)} communities, max={_bl.get('max', 0)}, god(>=1000)={_bl.get('god_count', 0)}  top10={_bl.get('top10', [])}")
+        lines.append(f"    re-clustered:        {_rc.get('count', 0)} communities, max={_rc.get('max', 0)}, god(>=1000)={_rc.get('god_count', 0)}  top10={_rc.get('top10', [])}")
     lines.append("  concept changes:")
     lines.append(f"    stable:    {_sum.get('stable', 0)}")
     lines.append(f"    growth:    {_sum.get('growth', 0)}")
     lines.append(f"    merge:     {_sum.get('merge', 0)}")
+    lines.append(f"    collapse:  {_sum.get('collapse', 0)}")
     lines.append(f"    split:     {_sum.get('split', 0)}")
     lines.append(f"    dissolved: {_sum.get('dissolved', 0)}")
     lines.append(f"  new concepts:  {_sum.get('new', 0)}")
@@ -1581,8 +1639,9 @@ def _format_wiki_impact_text(result: dict) -> str:
     # Split details
     splits = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "split"]
     if splits:
-        lines.append(f"  --- split ({len(splits)}) ---")
-        for cid, info in splits:
+        show = splits[:10]
+        lines.append(f"  --- split (top {len(show)} of {len(splits)}) ---")
+        for cid, info in show:
             name = info.get('name', _concept_names.get(cid, cid))
             old_n = len(info.get('old_members', []))
             into = info.get('split_into', {})
@@ -1612,18 +1671,41 @@ def _format_wiki_impact_text(result: dict) -> str:
     # Dissolved details
     dissolved = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "dissolved"]
     if dissolved:
-        lines.append(f"  --- dissolved ({len(dissolved)}) ---")
-        for cid, info in dissolved:
+        show = dissolved[:10]
+        lines.append(f"  --- dissolved (top {len(show)} of {len(dissolved)}) ---")
+        for cid, info in show:
             name = info.get('name', _concept_names.get(cid, cid))
             lines.append(f"    {name} ({len(info.get('old_members', []))} members lost)")
 
-    # Merge details
+    # Merge details — group by target community, top 10 groups
     merges = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "merge"]
     if merges:
         lines.append(f"  --- merge ({len(merges)}) ---")
+        _by_target: dict[int, list[str]] = {}
+        _tgt_sizes: dict[int, int] = {}
         for cid, info in merges:
-            name = info.get('name', _concept_names.get(cid, cid))
-            lines.append(f"    {name} merged with {info.get('merged_with', [])}")
+            tgt = info.get("target_community", -1)
+            _by_target.setdefault(tgt, []).append(cid)
+            _tgt_sizes[tgt] = info.get("target_size", 0)
+        for tgt, group in sorted(_by_target.items(), key=lambda kv: -len(kv[1]))[:10]:
+            names = [_concept_names.get(c, c) for c in group]
+            lines.append(f"    {', '.join(names)} -> Community {tgt} ({_tgt_sizes.get(tgt, 0)} members)")
+
+    # Collapse details — concepts absorbed into a god community
+    collapses = [(cid, info) for cid, info in result["concept_changes"].items() if info["type"] == "collapse"]
+    if collapses:
+        lines.append(f"  --- collapse ({len(collapses)}) ---")
+        _by_target_c: dict[int, list[str]] = {}
+        _tgt_sizes_c: dict[int, int] = {}
+        for cid, info in collapses:
+            tgt = info.get("target_community", -1)
+            _by_target_c.setdefault(tgt, []).append(cid)
+            _tgt_sizes_c[tgt] = info.get("target_size", 0)
+        for tgt, group in sorted(_by_target_c.items(), key=lambda kv: -len(kv[1]))[:10]:
+            lines.append(f"    Community {tgt} ({_tgt_sizes_c.get(tgt, 0)} members) absorbed {len(group)} concepts")
+        omitted = len(_by_target_c) - min(10, len(_by_target_c))
+        if omitted > 0:
+            lines.append(f"    ({omitted} more collapse targets)")
 
     # New concept candidates
     candidates = result.get("new_concept_candidates", [])

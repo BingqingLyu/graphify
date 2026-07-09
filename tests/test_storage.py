@@ -565,6 +565,7 @@ def test_analyze_wiki_impact_tracks_delta_and_weak_links(monkeypatch):
         return {
             0: ["old_a", "old_b", "drift", "delta1", "delta2"],
             1: ["old_c"],
+            2: ["old_d", "delta3"],
         }
 
     monkeypatch.setattr(storage, "run_leiden", fake_run_leiden)
@@ -574,19 +575,25 @@ def test_analyze_wiki_impact_tracks_delta_and_weak_links(monkeypatch):
             {"id": "c1", "name": "Concept One", "members": ["old_a", "old_b"]},
             {"id": "c2", "name": "Concept Two", "members": ["drift"]},
             {"id": "c3", "name": "Concept Three", "members": ["old_c"]},
+            {"id": "c4", "name": "Concept Four", "members": ["old_d"]},
         ],
     )
 
-    growth = result["concept_changes"]["c1"]
+    # c1 and c2 both have dominant community 0 -> detected as merge
+    c1_change = result["concept_changes"]["c1"]
     assert calls == [{
         "incremental": True,
         "ensure_column": False,
         "allow_temporary_writes": False,
         "write_back": False,
     }]
-    assert growth["type"] == "growth"
-    assert growth["delta_members"] == ["delta1", "delta2"]
-    assert growth["old_drift_members"] == ["drift"]
+    assert c1_change["type"] == "merge"
+    assert c1_change["target_community"] == 0
+    assert "c2" in c1_change["merged_with"]
+    # c4 has an independent dominant community -> growth with delta
+    c4_change = result["concept_changes"]["c4"]
+    assert c4_change["type"] == "growth"
+    assert c4_change["delta_members"] == ["delta3"]
     assert result["summary"]["new_links"] == 0
     assert result["summary"]["weak_new_links"] == 1
     assert result["link_changes"]["weak_new_links"] == [
@@ -635,7 +642,8 @@ def test_format_wiki_impact_shows_delta_and_omits_weak_links():
     assert "Concept One -> Concept Two" not in text
 
 
-def test_run_leiden_write_back_false_restores_temporary_assignments(monkeypatch):
+def test_run_leiden_warm_start_no_temporary_assignment(monkeypatch):
+    """NeuG handles leiden_comm=-1 natively; no temp ID assignment needed."""
     import graphify.storage as storage
 
     class FakeConn:
@@ -643,10 +651,6 @@ def test_run_leiden_write_back_false_restores_temporary_assignments(monkeypatch)
             self.set_queries = []
 
         def execute(self, query, parameters=None):
-            if "max(n.leiden_comm)" in query:
-                return [[5]]
-            if "n.leiden_comm < 0 RETURN n.id" in query:
-                return [["new1"], ["new2"]]
             if "SET n.leiden_comm" in query:
                 self.set_queries.append((query, parameters))
             return []
@@ -659,38 +663,34 @@ def test_run_leiden_write_back_false_restores_temporary_assignments(monkeypatch)
     monkeypatch.setattr(storage, "_leiden_on_projected", lambda *args, **kwargs: {1: ["new1"]})
     monkeypatch.setattr(storage, "_write_leiden_comm_to_nodes", lambda conn, communities: writes.append(communities))
 
-    result = storage.run_leiden(fake_conn, incremental=True, write_back=False, allow_temporary_writes=True)
+    result = storage.run_leiden(fake_conn, incremental=True, write_back=False)
 
     assert result == {1: ["new1"]}
     assert writes == []
-    set_values = [query.rsplit("=", 1)[-1].strip() for query, _ in fake_conn.set_queries]
-    assert set_values == ["6", "7", "-1", "-1"]
+    assert fake_conn.set_queries == [], "no SET leiden_comm queries expected"
 
 
-def test_run_leiden_readonly_rejects_temporary_assignments(monkeypatch):
-    import pytest
+def test_run_leiden_allow_temporary_writes_is_noop(monkeypatch):
+    """allow_temporary_writes is deprecated and has no effect."""
     import graphify.storage as storage
 
     class FakeConn:
         def execute(self, query, parameters=None):
-            if "max(n.leiden_comm)" in query:
-                return [[5]]
-            if "n.leiden_comm < 0 RETURN n.id" in query:
-                return [["new1"]]
-            if "SET n.leiden_comm" in query or "ALTER TABLE" in query:
-                raise AssertionError(f"unexpected write query: {query}")
             return []
 
     monkeypatch.setattr(storage, "_ensure_gds", lambda conn: None)
-    monkeypatch.setattr(storage, "_ensure_leiden_comm_column", lambda conn: (_ for _ in ()).throw(AssertionError("unexpected schema ensure")))
+    monkeypatch.setattr(storage, "_ensure_leiden_comm_column", lambda conn: None)
     monkeypatch.setattr(storage, "_has_leiden_comm_data", lambda conn: True)
+    monkeypatch.setattr(storage, "_leiden_on_projected", lambda *args, **kwargs: {1: ["new1"]})
+    monkeypatch.setattr(storage, "_write_leiden_comm_to_nodes", lambda conn, communities: None)
 
-    with pytest.raises(RuntimeError, match="strict read-only Leiden warm-start"):
-        storage.run_leiden(
-            FakeConn(),
-            incremental=True,
-            ensure_column=False,
-            allow_temporary_writes=False,
-            write_back=False,
-        )
+    # Should NOT raise, even with allow_temporary_writes=False
+    result = storage.run_leiden(
+        FakeConn(),
+        incremental=True,
+        ensure_column=False,
+        allow_temporary_writes=False,
+        write_back=False,
+    )
+    assert result == {1: ["new1"]}
 
