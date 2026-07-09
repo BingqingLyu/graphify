@@ -1202,12 +1202,18 @@ def analyze_wiki_impact(
                     "old_members": old_nodes,
                 }
 
-    # Step 3.5: Detect merges / collapses (collapse-first).
-    # Multiple concepts whose dominant community is the same new community
-    # have effectively merged. When too many concepts pile into one community
-    # it is a Leiden collapse (god community), not a genuine merge.
-    _MERGE_MAX_CONCEPTS = 10
-    _GOD_THRESHOLD = 1000
+    # Step 3.5: Detect merges / collapses (collapse-first, size-based).
+    # A community is a collapse target if it is disproportionately large
+    # relative to the baseline distribution — this adapts to different project
+    # sizes without hard-coded group-count thresholds.
+    _GOD_THRESHOLD = 1000        # absolute: any community this large is collapse
+    _COLLAPSE_RATIO = 3.0        # relative: target > 3x baseline max → collapse
+    _baseline_max = max((len(m) for m in old_members.values()), default=0)
+    _relative_collapse = _COLLAPSE_RATIO * _baseline_max
+
+    def _is_collapse_size(sz: int) -> bool:
+        return sz >= _GOD_THRESHOLD or sz > _relative_collapse
+
     merge_groups: dict[int, list[str]] = {}
     for old_cid, dom_cid in dominant_assignments.items():
         merge_groups.setdefault(dom_cid, []).append(old_cid)
@@ -1218,7 +1224,7 @@ def analyze_wiki_impact(
         if len(group) < 2:
             continue
         target_size = len(new_communities.get(dom_cid, []))
-        if len(group) > _MERGE_MAX_CONCEPTS or target_size >= _GOD_THRESHOLD:
+        if _is_collapse_size(target_size):
             collapse_targets.add(dom_cid)
 
     # Second pass: reclassify concepts in each group.
@@ -1242,19 +1248,19 @@ def analyze_wiki_impact(
 
     # Step 3.6: Catch growth concepts (path B) whose target is a collapse
     # community. These escaped Step 3.5 because they weren't in
-    # dominant_assignments (dominant_ratio < 0.5). Also catches growth into
-    # any god-sized community (>=1000) even if no other concept targeted it.
+    # dominant_assignments (dominant_ratio < 0.5).
     for old_cid, change in concept_changes.items():
         if change.get("type") != "growth":
             continue
         target_comm = change.get("target_community", -1)
         new_members = change.get("new_members") or []
-        if target_comm in collapse_targets or len(new_members) >= _GOD_THRESHOLD:
+        target_size = len(new_members)
+        if target_comm in collapse_targets or _is_collapse_size(target_size):
             concept_changes[old_cid] = {
                 "type": "collapse",
                 "old_members": change.get("old_members", []),
                 "target_community": target_comm,
-                "target_size": len(new_members),
+                "target_size": target_size,
                 "group_size": 0,
                 "merged_with": [],
             }
