@@ -427,13 +427,12 @@ def test_import_wiki_auto_detect(tmp_db, tmp_path):
 
 # --- analyze_wiki_impact ---
 
-def test_analyze_wiki_impact_new_concept(tmp_db, monkeypatch):
+def test_analyze_wiki_impact_new_concept(tmp_db):
     """A community where >50% of nodes are unknown should be a new concept candidate."""
-    import graphify.storage as storage
     from graphify.storage import analyze_wiki_impact, ingest_concepts, ingest_extraction
     db, conn = _init(tmp_db)
 
-    # Ingest base data: 4 existing nodes
+    # Base: two disconnected pairs → Leiden produces 2 communities
     base = {
         "nodes": [
             {"id": "n1", "label": "A", "type": "code", "source_file": "f1.py"},
@@ -447,15 +446,18 @@ def test_analyze_wiki_impact_new_concept(tmp_db, monkeypatch):
         ],
     }
     ingest_extraction(conn, base, incremental=False)
-    conn.execute("MATCH (n:node) SET n.leiden_comm = 10")
 
-    # Import wiki concept covering n1, n2
+    # Set leiden_comm: n1/n2 → community 0, n3/n4 → community 1
+    conn.execute("MATCH (n:node) WHERE n.id IN ['n1','n2'] SET n.leiden_comm = 0")
+    conn.execute("MATCH (n:node) WHERE n.id IN ['n3','n4'] SET n.leiden_comm = 1")
+
+    # Wiki concept covering n1, n2
     ingest_concepts(conn, [{
         "id": "wiki_c1", "name": "Wiki C1", "source": "wiki",
         "members": ["n1", "n2"],
     }])
 
-    # Simulate extract --no-cluster: ingest delta (3 new nodes)
+    # Delta: 3 new nodes forming a disconnected component → Leiden creates a 3rd community
     delta = {
         "nodes": [
             {"id": "x1", "label": "X1", "type": "code", "source_file": "f3.py"},
@@ -469,16 +471,17 @@ def test_analyze_wiki_impact_new_concept(tmp_db, monkeypatch):
     }
     ingest_extraction(conn, delta, incremental=True)
 
-    monkeypatch.setattr(storage, "run_leiden", lambda *args, **kwargs: {
-        0: ["n1", "n2", "x1", "x2", "x3"],
-        1: ["n3", "n4"],
-    })
-
-    # Now analyze: graph.db has old+new data, concepts still reflect old state
+    # Analyze with real Leiden — no mock
     result = analyze_wiki_impact(conn)
     assert "new_concept_candidates" in result
     assert "summary" in result
-    assert result["summary"]["new"] >= 0
+    # The x1/x2/x3 community should be detected as a new concept candidate
+    assert result["summary"]["new"] >= 1
+    new_cands = result["new_concept_candidates"]
+    new_nodes = set()
+    for cand in new_cands:
+        new_nodes.update(cand["members"])
+    assert {"x1", "x2", "x3"}.issubset(new_nodes)
     _close(db, conn)
 
 
@@ -541,65 +544,97 @@ def test_get_concept_links(tmp_db):
     _close(db, conn)
 
 
-def test_analyze_wiki_impact_tracks_delta_and_weak_links(monkeypatch):
-    import graphify.storage as storage
+def test_analyze_wiki_impact_tracks_delta_and_weak_links(tmp_db):
+    """Real DB + real Leiden: merge, growth, delta, and weak links."""
+    from graphify.storage import analyze_wiki_impact, ingest_concepts, ingest_extraction
+    db, conn = _init(tmp_db)
 
-    calls = []
-
-    def fake_run_leiden(
-        conn,
-        resolution=1.0,
-        concurrency=None,
-        *,
-        incremental=False,
-        ensure_column=True,
-        allow_temporary_writes=True,
-        write_back=True,
-    ):
-        calls.append({
-            "incremental": incremental,
-            "ensure_column": ensure_column,
-            "allow_temporary_writes": allow_temporary_writes,
-            "write_back": write_back,
-        })
-        return {
-            0: ["old_a", "old_b", "drift", "delta1", "delta2"],
-            1: ["old_c"],
-            2: ["old_d", "delta3"],
-        }
-
-    monkeypatch.setattr(storage, "run_leiden", fake_run_leiden)
-    result = storage.analyze_wiki_impact(
-        object(),
-        baseline_concepts=[
-            {"id": "c1", "name": "Concept One", "members": ["old_a", "old_b"]},
-            {"id": "c2", "name": "Concept Two", "members": ["drift"]},
-            {"id": "c3", "name": "Concept Three", "members": ["old_c"]},
-            {"id": "c4", "name": "Concept Four", "members": ["old_d"]},
+    # Base graph: 5 old nodes.
+    #   old_a <-> old_b <-> drift  (connected triplet)
+    #   old_c                      (isolated)
+    #   old_d                      (isolated)
+    base = {
+        "nodes": [
+            {"id": "old_a", "label": "A", "type": "code", "source_file": "f1.py"},
+            {"id": "old_b", "label": "B", "type": "code", "source_file": "f1.py"},
+            {"id": "drift", "label": "D", "type": "code", "source_file": "f2.py"},
+            {"id": "old_c", "label": "C", "type": "code", "source_file": "f2.py"},
+            {"id": "old_d", "label": "E", "type": "code", "source_file": "f3.py"},
         ],
-    )
+        "edges": [
+            {"source": "old_a", "target": "old_b", "relation": "calls"},
+            {"source": "old_b", "target": "drift", "relation": "calls"},
+        ],
+    }
+    ingest_extraction(conn, base, incremental=False)
 
-    # c1 and c2 both have dominant community 0 -> detected as merge
-    c1_change = result["concept_changes"]["c1"]
-    assert calls == [{
-        "incremental": True,
-        "ensure_column": False,
-        "allow_temporary_writes": False,
-        "write_back": False,
-    }]
+    # Set leiden_comm: old_a/old_b=0, drift=1, old_c=2, old_d=3
+    conn.execute("MATCH (n:node) WHERE n.id IN ['old_a','old_b'] SET n.leiden_comm = 0")
+    conn.execute("MATCH (n:node) WHERE n.id = 'drift' SET n.leiden_comm = 1")
+    conn.execute("MATCH (n:node) WHERE n.id = 'old_c' SET n.leiden_comm = 2")
+    conn.execute("MATCH (n:node) WHERE n.id = 'old_d' SET n.leiden_comm = 3")
+
+    # Concepts: c1={old_a,old_b}, c2={drift}, c3={old_c}, c4={old_d}
+    ingest_concepts(conn, [
+        {"id": "c1", "name": "Concept One", "source": "wiki", "members": ["old_a", "old_b"]},
+        {"id": "c2", "name": "Concept Two", "source": "wiki", "members": ["drift"]},
+        {"id": "c3", "name": "Concept Three", "source": "wiki", "members": ["old_c"]},
+        {"id": "c4", "name": "Concept Four", "source": "wiki", "members": ["old_d"]},
+    ])
+
+    # Delta: delta1->old_a, delta2->old_b (join the triplet community)
+    #        delta3->old_d (joins old_d)
+    delta = {
+        "nodes": [
+            {"id": "delta1", "label": "D1", "type": "code", "source_file": "f4.py"},
+            {"id": "delta2", "label": "D2", "type": "code", "source_file": "f4.py"},
+            {"id": "delta3", "label": "D3", "type": "code", "source_file": "f5.py"},
+        ],
+        "edges": [
+            {"source": "delta1", "target": "old_a", "relation": "calls"},
+            {"source": "delta2", "target": "old_b", "relation": "calls"},
+            {"source": "delta3", "target": "old_d", "relation": "calls"},
+        ],
+    }
+    ingest_extraction(conn, delta, incremental=True)
+
+    # Analyze with real Leiden -- no mock
+    result = analyze_wiki_impact(conn)
+    concept_changes = result["concept_changes"]
+
+    # Find which new community contains old_a
+    new_communities = result["new_communities"]
+    comm_with_old_a = None
+    for cid, members in new_communities.items():
+        if "old_a" in members:
+            comm_with_old_a = cid
+            break
+    assert comm_with_old_a is not None
+
+    # old_a, old_b, drift, delta1, delta2 should all be in the same community
+    comm_members = set(new_communities[comm_with_old_a])
+    assert {"old_a", "old_b", "drift", "delta1", "delta2"}.issubset(comm_members)
+
+    # c1 and c2 both dominant to same community -> merge
+    c1_change = concept_changes["c1"]
+    c2_change = concept_changes["c2"]
     assert c1_change["type"] == "merge"
-    assert c1_change["target_community"] == 0
+    assert c2_change["type"] == "merge"
+    assert c1_change["target_community"] == comm_with_old_a
     assert "c2" in c1_change["merged_with"]
-    # c4 has an independent dominant community -> growth with delta
-    c4_change = result["concept_changes"]["c4"]
+
+    # c4 has delta3 -> growth
+    c4_change = concept_changes["c4"]
     assert c4_change["type"] == "growth"
-    assert c4_change["delta_members"] == ["delta3"]
-    assert result["summary"]["new_links"] == 0
-    assert result["summary"]["weak_new_links"] == 1
-    assert result["link_changes"]["weak_new_links"] == [
-        {"from": "c1", "to": "c2", "co_occurrence": 1}
-    ]
+    assert "delta3" in c4_change["delta_members"]
+
+    # c1 and c2 co-occur in the same community -> at least a weak link
+    all_links = result["link_changes"]["new_links"] + result["link_changes"]["weak_new_links"]
+    link_pairs = {(l["from"], l["to"]) for l in all_links}
+    assert ("c1", "c2") in link_pairs or ("c2", "c1") in link_pairs
+
     assert result["concept_names"]["c2"] == "Concept Two"
+    _close(db, conn)
 
 
 def test_format_wiki_impact_shows_delta_and_omits_weak_links():
@@ -642,55 +677,45 @@ def test_format_wiki_impact_shows_delta_and_omits_weak_links():
     assert "Concept One -> Concept Two" not in text
 
 
-def test_run_leiden_warm_start_no_temporary_assignment(monkeypatch):
-    """NeuG handles leiden_comm=-1 natively; no temp ID assignment needed."""
-    import graphify.storage as storage
+def test_run_leiden_warm_start_no_temporary_assignment(tmp_db):
+    """Warm-start Leiden on real DB: all nodes assigned, leiden_comm unchanged with write_back=False."""
+    from graphify.storage import run_leiden, ingest_extraction
+    db, conn = _init(tmp_db)
 
-    class FakeConn:
-        def __init__(self):
-            self.set_queries = []
+    # Two disconnected components → Leiden produces 2 communities
+    data = {
+        "nodes": [
+            {"id": "n1", "label": "A", "type": "code", "source_file": "f1.py"},
+            {"id": "n2", "label": "B", "type": "code", "source_file": "f1.py"},
+            {"id": "n3", "label": "C", "type": "code", "source_file": "f2.py"},
+            {"id": "n4", "label": "D", "type": "code", "source_file": "f2.py"},
+        ],
+        "edges": [
+            {"source": "n1", "target": "n2", "relation": "calls"},
+            {"source": "n3", "target": "n4", "relation": "calls"},
+        ],
+    }
+    ingest_extraction(conn, data, incremental=False)
 
-        def execute(self, query, parameters=None):
-            if "SET n.leiden_comm" in query:
-                self.set_queries.append((query, parameters))
-            return []
+    # Set leiden_comm to known values
+    conn.execute("MATCH (n:node) WHERE n.id IN ['n1','n2'] SET n.leiden_comm = 10")
+    conn.execute("MATCH (n:node) WHERE n.id IN ['n3','n4'] SET n.leiden_comm = 20")
 
-    fake_conn = FakeConn()
-    writes = []
-    monkeypatch.setattr(storage, "_ensure_gds", lambda conn: None)
-    monkeypatch.setattr(storage, "_ensure_leiden_comm_column", lambda conn: None)
-    monkeypatch.setattr(storage, "_has_leiden_comm_data", lambda conn: True)
-    monkeypatch.setattr(storage, "_leiden_on_projected", lambda *args, **kwargs: {1: ["new1"]})
-    monkeypatch.setattr(storage, "_write_leiden_comm_to_nodes", lambda conn, communities: writes.append(communities))
+    # Run with write_back=False — leiden_comm should NOT change
+    result = run_leiden(conn, incremental=True, write_back=False)
+    # return_previous=False → result is dict[int, list[str]]
+    communities: dict = result  # type: ignore[assignment]
 
-    result = storage.run_leiden(fake_conn, incremental=True, write_back=False)
+    # All nodes must be assigned to a community
+    all_assigned = set()
+    for members in communities.values():
+        all_assigned.update(members)
+    assert all_assigned == {"n1", "n2", "n3", "n4"}
 
-    assert result == {1: ["new1"]}
-    assert writes == []
-    assert fake_conn.set_queries == [], "no SET leiden_comm queries expected"
+    # leiden_comm in DB should be unchanged (write_back=False)
+    rows = list(conn.execute("MATCH (n:node) RETURN n.id, n.leiden_comm ORDER BY n.id"))
+    comm_map = {r[0]: r[1] for r in rows}
+    assert comm_map == {"n1": 10, "n2": 10, "n3": 20, "n4": 20}
+    _close(db, conn)
 
-
-def test_run_leiden_allow_temporary_writes_is_noop(monkeypatch):
-    """allow_temporary_writes is deprecated and has no effect."""
-    import graphify.storage as storage
-
-    class FakeConn:
-        def execute(self, query, parameters=None):
-            return []
-
-    monkeypatch.setattr(storage, "_ensure_gds", lambda conn: None)
-    monkeypatch.setattr(storage, "_ensure_leiden_comm_column", lambda conn: None)
-    monkeypatch.setattr(storage, "_has_leiden_comm_data", lambda conn: True)
-    monkeypatch.setattr(storage, "_leiden_on_projected", lambda *args, **kwargs: {1: ["new1"]})
-    monkeypatch.setattr(storage, "_write_leiden_comm_to_nodes", lambda conn, communities: None)
-
-    # Should NOT raise, even with allow_temporary_writes=False
-    result = storage.run_leiden(
-        FakeConn(),
-        incremental=True,
-        ensure_column=False,
-        allow_temporary_writes=False,
-        write_back=False,
-    )
-    assert result == {1: ["new1"]}
 

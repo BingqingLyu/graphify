@@ -2272,7 +2272,7 @@ def main() -> None:
         print("  wiki-impact [path]       analyze how graph changes affect wiki concepts")
         print("    --baseline <path>       use external wiki as baseline (default: graph.db concepts)")
         print("    --min-concept-size N    ignore concepts with fewer than N members (default 3)")
-        print("    --format text|json      output format")
+        print("    --format text|json|llm-json  output format")
         print("    --backend B             LLM backend for naming new concepts (optional)")
         print("    --model M               override backend model")
         print("  query \"<question>\"       BFS traversal of graph.json for a question")
@@ -5222,7 +5222,7 @@ def main() -> None:
         print(f"Merged: {len(merged2['nodes'])} nodes, {len(merged2['edges'])} edges")
 
     elif cmd == "wiki-impact":
-        # graphify wiki-impact [path] [--baseline <wiki-path>] [--format text|json]
+        # graphify wiki-impact [path] [--baseline <wiki-path>] [--format text|json|llm-json]
         #                       [--backend B] [--model M]
         # Analyze how graph changes affect wiki concepts.
         wiki_out_format = "text"
